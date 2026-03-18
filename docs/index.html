@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AERIS-10 Simulation Reports</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --card: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #22d3ee;
+      --accent-2: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 800px at 20% -10%, #1e293b 0%, var(--bg) 55%);
+      line-height: 1.45;
+    }
+    .wrap {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    .hero {
+      background: linear-gradient(135deg, #0b1220 0%, #111827 55%, #0b1220 100%);
+      border: 1px solid #263244;
+      border-radius: 14px;
+      padding: 22px;
+      margin-bottom: 22px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.8rem;
+    }
+    .sub {
+      margin: 0;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 1.1rem;
+    }
+    .meta {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .btns {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-block;
+      text-decoration: none;
+      color: #06131a;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+      font-weight: 600;
+      border-radius: 8px;
+      padding: 9px 12px;
+    }
+    .btn.alt {
+      color: var(--text);
+      background: #0b1220;
+      border: 1px solid #334155;
+    }
+    .foot {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>AERIS-10 Public Simulation Reports</h1>
+      <p class="sub">GitHub Pages landing for antenna and Python simulation report artifacts.</p>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>Antenna Simulation Report</h2>
+        <p class="meta">Document: <code>AERIS_Antenna_Report.pdf</code></p>
+        <div class="btns">
+          <a class="btn" href="AERIS_Antenna_Report.pdf" target="_blank" rel="noopener">Open PDF</a>
+          <a class="btn alt" href="AERIS_Antenna_Report.pdf" download>Download</a>
+        </div>
+      </article>
+
+      <article class="card">
+        <h2>Python Simulation Report</h2>
+        <p class="meta">Document: <code>AERIS_Simulation_Report.pdf</code></p>
+        <div class="btns">
+          <a class="btn" href="AERIS_Simulation_Report.pdf" target="_blank" rel="noopener">Open PDF</a>
+          <a class="btn alt" href="AERIS_Simulation_Report.pdf" download>Download</a>
+        </div>
+      </article>
+    </section>
+
+    <p class="foot">Tip: In GitHub, enable Pages on the <code>main</code> branch with source folder <code>/docs</code>.</p>
+  </main>
+</body>
+</html>
