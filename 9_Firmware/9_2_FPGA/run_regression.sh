@@ -1,10 +1,12 @@
 #!/bin/bash
 # ===========================================================================
 # FPGA Regression Test Runner for AERIS-10 Radar
-# Runs all verified iverilog testbenches and reports pass/fail summary.
+# Phase 0: Vivado-style lint (catches issues iverilog silently accepts)
+# Phase 1+: Compile and run all verified iverilog testbenches
 #
-# Usage:  ./run_regression.sh [--quick]
-#   --quick   Skip long-running integration tests (receiver golden, system TB)
+# Usage:  ./run_regression.sh [--quick] [--skip-lint]
+#   --quick      Skip long-running integration tests (receiver golden, system TB)
+#   --skip-lint  Skip Phase 0 lint checks (not recommended)
 #
 # Exit code: 0 if all tests pass, 1 if any fail
 # ===========================================================================
@@ -15,20 +17,237 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 QUICK=0
-if [[ "${1:-}" == "--quick" ]]; then
-    QUICK=1
-fi
+SKIP_LINT=0
+for arg in "$@"; do
+    case "$arg" in
+        --quick) QUICK=1 ;;
+        --skip-lint) SKIP_LINT=1 ;;
+    esac
+done
 
 PASS=0
 FAIL=0
 SKIP=0
+LINT_WARN=0
+LINT_ERR=0
 ERRORS=""
 
 # Colors (if terminal supports it)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# ===========================================================================
+# PHASE 0: VIVADO-STYLE LINT
+# Two layers:
+#   (A) iverilog -Wall full-design compile — parse for serious warnings
+#   (B) Custom regex checks for patterns Vivado treats as errors
+# ===========================================================================
+
+# Production RTL file list (same as system TB minus testbench files)
+# Uses ADC stub for IBUFDS/BUFIO primitives that iverilog can't parse
+PROD_RTL=(
+    radar_system_top.v
+    radar_transmitter.v
+    dac_interface_single.v
+    plfm_chirp_controller.v
+    radar_receiver_final.v
+    tb/ad9484_interface_400m_stub.v
+    ddc_400m.v
+    nco_400m_enhanced.v
+    cic_decimator_4x_enhanced.v
+    cdc_modules.v
+    fir_lowpass.v
+    ddc_input_interface.v
+    chirp_memory_loader_param.v
+    latency_buffer.v
+    matched_filter_multi_segment.v
+    matched_filter_processing_chain.v
+    range_bin_decimator.v
+    doppler_processor.v
+    xfft_32.v
+    fft_engine.v
+    usb_data_interface.v
+    edge_detector.v
+    radar_mode_controller.v
+)
+
+# Source-only RTL (not instantiated at top level, but should still be lint-clean)
+# Note: ad9484_interface_400m.v is excluded — it uses Xilinx primitives
+# (IBUFDS, BUFIO, BUFG, IDDR) that iverilog cannot compile. The production
+# design uses tb/ad9484_interface_400m_stub.v for simulation instead.
+EXTRA_RTL=(
+    frequency_matched_filter.v
+)
+
+# ---- Layer A: iverilog -Wall compilation ----
+run_lint_iverilog() {
+    local label="$1"
+    shift
+    local files=("$@")
+    local warn_file="/tmp/iverilog_lint_$$_${label}.log"
+
+    printf "  %-45s " "iverilog -Wall ($label)"
+
+    if ! iverilog -g2001 -DSIMULATION -Wall -o /dev/null "${files[@]}" 2>"$warn_file"; then
+        # Hard compile error — always fatal
+        echo -e "${RED}COMPILE ERROR${NC}"
+        while IFS= read -r line; do
+            echo "    $line"
+        done < "$warn_file"
+        LINT_ERR=$((LINT_ERR + 1))
+        rm -f "$warn_file"
+        return 1
+    fi
+
+    # Parse warnings — classify as error-level or info-level
+    local err_count=0
+    local info_count=0
+    local err_lines=""
+
+    while IFS= read -r line; do
+        # Part-select out of range — Vivado Synth 8-524 (ERROR in Vivado)
+        if echo "$line" | grep -q 'Part select.*is selecting after the vector\|out of bound bits'; then
+            err_count=$((err_count + 1))
+            err_lines="$err_lines\n    ${RED}[VIVADO-ERR]${NC} $line"
+        # Port width mismatch / connection mismatch
+        elif echo "$line" | grep -q 'port.*does not match\|Port.*mismatch'; then
+            err_count=$((err_count + 1))
+            err_lines="$err_lines\n    ${RED}[VIVADO-ERR]${NC} $line"
+        # Informational warnings (timescale, dangling ports, array sensitivity)
+        elif echo "$line" | grep -q 'timescale\|dangling\|sensitive to all'; then
+            info_count=$((info_count + 1))
+        # Unknown warning — report but don't fail
+        elif [[ -n "$line" ]]; then
+            info_count=$((info_count + 1))
+        fi
+    done < "$warn_file"
+
+    if [[ "$err_count" -gt 0 ]]; then
+        echo -e "${RED}FAIL${NC} ($err_count Vivado-class errors, $info_count info)"
+        echo -e "$err_lines"
+        LINT_ERR=$((LINT_ERR + err_count))
+    else
+        echo -e "${GREEN}PASS${NC} ($info_count info warnings)"
+    fi
+
+    rm -f "$warn_file"
+}
+
+# ---- Layer B: Custom regex static checks ----
+# Catches patterns that Vivado treats as errors/warnings but iverilog ignores
+run_lint_static() {
+    printf "  %-45s " "Static RTL checks"
+
+    local err_count=0
+    local warn_count=0
+    local err_lines=""
+    local warn_lines=""
+
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        # Skip testbench files (tb/ directory) — only lint production RTL
+        case "$f" in tb/*) continue ;; esac
+
+        local linenum=0
+        while IFS= read -r line; do
+            linenum=$((linenum + 1))
+
+            # --- CHECK 1: Part-select with literal range on reg ---
+            # Pattern: identifier[N:M] where N exceeds declared width
+            # (iverilog catches this, but belt-and-suspenders)
+
+            # --- CHECK 2: case/casex/casez without default (non-full case) ---
+            # Vivado SYNTH-6 / inferred latch warning
+            # Heuristic: look for case/casex/casez, then check if 'default' appears
+            # before the matching 'endcase'. This is approximate — full parsing
+            # would need a real parser. We flag 'case' lines so the developer
+            # can manually verify.
+            # (Handled below as a multi-line check)
+
+            # --- CHECK 3: Blocking assignment (=) inside always @(posedge ...) ---
+            # Vivado SYNTH-5 warning for inferred latches / race conditions
+            # Only flag if the always block is clocked (posedge/negedge)
+            # This is a heuristic — we check for '= ' that isn't '<=', '==', '!='
+            # inside an always block header containing 'posedge' or 'negedge'.
+            # (Too complex for line-by-line — skip for now, handled by testbenches)
+
+            # --- CHECK 4: Multi-driven register (assign + always on same signal) ---
+            # (Would need cross-file analysis — skip for v1)
+
+        done < "$f"
+    done
+
+    # --- Multi-line check: case without default ---
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        case "$f" in tb/*) continue ;; esac
+
+        # Find case blocks and check for default
+        # Use awk to find case..endcase blocks missing 'default'
+        local missing_defaults
+        missing_defaults=$(awk '
+            /^[[:space:]]*(case|casex|casez)[[:space:]]*\(/ {
+                case_line = NR
+                case_file = FILENAME
+                has_default = 0
+                in_case = 1
+                next
+            }
+            in_case && /default[[:space:]]*:/ {
+                has_default = 1
+            }
+            in_case && /endcase/ {
+                if (!has_default) {
+                    printf "%s:%d: case statement without default\n", FILENAME, case_line
+                }
+                in_case = 0
+            }
+        ' "$f" 2>/dev/null)
+
+        if [[ -n "$missing_defaults" ]]; then
+            while IFS= read -r hit; do
+                warn_count=$((warn_count + 1))
+                warn_lines="$warn_lines\n    ${YELLOW}[SYNTH-6]${NC} $hit"
+            done <<< "$missing_defaults"
+        fi
+    done
+
+    # --- Single-line regex checks across all production RTL ---
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        case "$f" in tb/*) continue ;; esac
+
+        local linenum=0
+        while IFS= read -r line; do
+            linenum=$((linenum + 1))
+
+            # CHECK 5: $readmemh / $readmemb in synthesizable code
+            # (Only valid in simulation blocks — flag if outside `ifdef SIMULATION)
+            # This is hard to check line-by-line without tracking ifdefs.
+            # Skip for v1.
+
+            # CHECK 6: Unused `include files (informational only)
+            # Skip for v1.
+
+            :  # placeholder — prevents empty loop body
+        done < "$f"
+    done
+
+    if [[ "$err_count" -gt 0 ]]; then
+        echo -e "${RED}FAIL${NC} ($err_count errors, $warn_count warnings)"
+        echo -e "$err_lines"
+        LINT_ERR=$((LINT_ERR + err_count))
+    elif [[ "$warn_count" -gt 0 ]]; then
+        echo -e "${YELLOW}WARN${NC} ($warn_count warnings)"
+        echo -e "$warn_lines"
+        LINT_WARN=$((LINT_WARN + warn_count))
+    else
+        echo -e "${GREEN}PASS${NC}"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Helper: compile and run a single testbench
@@ -91,9 +310,46 @@ echo "iverilog: $(iverilog -V 2>&1 | head -1)"
 echo ""
 
 # ===========================================================================
-# UNIT TESTS — Changed Modules (HIGH PRIORITY)
+# PHASE 0: LINT (Vivado-class error detection)
 # ===========================================================================
-echo "--- HIGH PRIORITY: Changed Modules ---"
+if [[ "$SKIP_LINT" -eq 0 ]]; then
+    echo "--- PHASE 0: LINT (Vivado-class checks) ---"
+
+    # Layer A: iverilog -Wall on full production design
+    run_lint_iverilog "production" "${PROD_RTL[@]}"
+
+    # Layer A: standalone modules not in top-level hierarchy
+    for extra in "${EXTRA_RTL[@]}"; do
+        if [[ -f "$extra" ]]; then
+            run_lint_iverilog "$(basename "$extra" .v)" "$extra"
+        fi
+    done
+
+    # Layer B: custom static regex checks
+    ALL_RTL=("${PROD_RTL[@]}" "${EXTRA_RTL[@]}")
+    run_lint_static "${ALL_RTL[@]}"
+
+    echo ""
+    if [[ "$LINT_ERR" -gt 0 ]]; then
+        echo -e "${RED}  LINT FAILED: $LINT_ERR Vivado-class error(s) detected.${NC}"
+        echo "  Fix lint errors before pushing to Vivado. Aborting regression."
+        echo ""
+        exit 1
+    elif [[ "$LINT_WARN" -gt 0 ]]; then
+        echo -e "${YELLOW}  LINT: $LINT_WARN advisory warning(s) (non-blocking)${NC}"
+    else
+        echo -e "${GREEN}  LINT: All checks passed${NC}"
+    fi
+    echo ""
+else
+    echo "--- PHASE 0: LINT (skipped via --skip-lint) ---"
+    echo ""
+fi
+
+# ===========================================================================
+# PHASE 1: UNIT TESTS — Changed Modules (HIGH PRIORITY)
+# ===========================================================================
+echo "--- PHASE 1: Changed Modules ---"
 
 run_test "CIC Decimator" \
     tb/tb_cic_reg.vvp \
@@ -114,9 +370,9 @@ run_test "Doppler Processor (DSP48)" \
 echo ""
 
 # ===========================================================================
-# INTEGRATION TESTS
+# PHASE 2: INTEGRATION TESTS
 # ===========================================================================
-echo "--- INTEGRATION TESTS ---"
+echo "--- PHASE 2: Integration Tests ---"
 
 run_test "DDC Chain (NCO→CIC→FIR)" \
     tb/tb_ddc_reg.vvp \
@@ -167,9 +423,9 @@ fi
 echo ""
 
 # ===========================================================================
-# UNIT TESTS — Signal Processing
+# PHASE 3: UNIT TESTS — Signal Processing
 # ===========================================================================
-echo "--- UNIT TESTS: Signal Processing ---"
+echo "--- PHASE 3: Signal Processing ---"
 
 run_test "FFT Engine" \
     tb/tb_fft_reg.vvp \
@@ -195,9 +451,9 @@ run_test "Matched Filter Chain" \
 echo ""
 
 # ===========================================================================
-# UNIT TESTS — Infrastructure
+# PHASE 4: UNIT TESTS — Infrastructure
 # ===========================================================================
-echo "--- UNIT TESTS: Infrastructure ---"
+echo "--- PHASE 4: Infrastructure ---"
 
 run_test "CDC Modules (3 variants)" \
     tb/tb_cdc_reg.vvp \
@@ -226,7 +482,18 @@ echo ""
 # ===========================================================================
 TOTAL=$((PASS + FAIL + SKIP))
 echo "============================================"
-echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped / $TOTAL total"
+echo "  RESULTS"
+echo "============================================"
+if [[ "$SKIP_LINT" -eq 0 ]]; then
+    if [[ "$LINT_ERR" -gt 0 ]]; then
+        echo -e "  Lint:  ${RED}$LINT_ERR error(s)${NC}, $LINT_WARN warning(s)"
+    elif [[ "$LINT_WARN" -gt 0 ]]; then
+        echo -e "  Lint:  ${GREEN}0 errors${NC}, ${YELLOW}$LINT_WARN warning(s)${NC}"
+    else
+        echo -e "  Lint:  ${GREEN}clean${NC}"
+    fi
+fi
+echo "  Tests: $PASS passed, $FAIL failed, $SKIP skipped / $TOTAL total"
 echo "============================================"
 
 if [[ -n "$ERRORS" ]]; then
