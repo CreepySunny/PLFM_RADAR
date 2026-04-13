@@ -125,7 +125,8 @@ class TestRadarProtocol(unittest.TestCase):
                             long_chirp=3000, long_listen=13700,
                             guard=17540, short_chirp=50,
                             short_listen=17450, chirps=32, range_mode=0,
-                            st_flags=0, st_detail=0, st_busy=0):
+                            st_flags=0, st_detail=0, st_busy=0,
+                            agc_gain=0, agc_peak=0, agc_sat=0, agc_enable=0):
         """Build a 26-byte status response matching FPGA format (Build 26)."""
         pkt = bytearray()
         pkt.append(STATUS_HEADER_BYTE)
@@ -146,8 +147,11 @@ class TestRadarProtocol(unittest.TestCase):
         w3 = ((short_listen & 0xFFFF) << 16) | (chirps & 0x3F)
         pkt += struct.pack(">I", w3)
 
-        # Word 4: {30'd0, range_mode[1:0]}
-        w4 = range_mode & 0x03
+        # Word 4: {agc_current_gain[3:0], agc_peak_magnitude[7:0],
+        #          agc_saturation_count[7:0], agc_enable, 9'd0, range_mode[1:0]}
+        w4 = (((agc_gain & 0x0F) << 28) | ((agc_peak & 0xFF) << 20) |
+              ((agc_sat & 0xFF) << 12) | ((agc_enable & 0x01) << 11) |
+              (range_mode & 0x03))
         pkt += struct.pack(">I", w4)
 
         # Word 5: {7'd0, self_test_busy, 8'd0, self_test_detail[7:0],
@@ -723,6 +727,7 @@ class TestOpcodeEnum(unittest.TestCase):
         expected = {0x01, 0x02, 0x03, 0x04,
                     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
                     0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                    0x28, 0x29, 0x2A, 0x2B, 0x2C,
                     0x30, 0x31, 0xFF}
         enum_values = {int(m) for m in Opcode}
         for op in expected:
@@ -745,6 +750,94 @@ class TestStatusResponseDefaults(unittest.TestCase):
         self.assertEqual(sr.self_test_flags, 0x1F)
         self.assertEqual(sr.self_test_detail, 0xAB)
         self.assertEqual(sr.self_test_busy, 1)
+
+
+class TestAGCOpcodes(unittest.TestCase):
+    """Verify AGC opcode enum members match FPGA RTL (0x28-0x2C)."""
+
+    def test_agc_enable_opcode(self):
+        self.assertEqual(Opcode.AGC_ENABLE, 0x28)
+
+    def test_agc_target_opcode(self):
+        self.assertEqual(Opcode.AGC_TARGET, 0x29)
+
+    def test_agc_attack_opcode(self):
+        self.assertEqual(Opcode.AGC_ATTACK, 0x2A)
+
+    def test_agc_decay_opcode(self):
+        self.assertEqual(Opcode.AGC_DECAY, 0x2B)
+
+    def test_agc_holdoff_opcode(self):
+        self.assertEqual(Opcode.AGC_HOLDOFF, 0x2C)
+
+
+class TestAGCStatusParsing(unittest.TestCase):
+    """Verify AGC fields in status_words[4] are parsed correctly."""
+
+    def _make_status_packet(self, **kwargs):
+        """Delegate to TestRadarProtocol helper."""
+        helper = TestRadarProtocol()
+        return helper._make_status_packet(**kwargs)
+
+    def test_agc_fields_default_zero(self):
+        """With no AGC fields set, all should be 0."""
+        raw = self._make_status_packet()
+        sr = RadarProtocol.parse_status_packet(raw)
+        self.assertEqual(sr.agc_current_gain, 0)
+        self.assertEqual(sr.agc_peak_magnitude, 0)
+        self.assertEqual(sr.agc_saturation_count, 0)
+        self.assertEqual(sr.agc_enable, 0)
+
+    def test_agc_fields_nonzero(self):
+        """AGC fields round-trip through status packet."""
+        raw = self._make_status_packet(agc_gain=7, agc_peak=200,
+                                       agc_sat=15, agc_enable=1)
+        sr = RadarProtocol.parse_status_packet(raw)
+        self.assertEqual(sr.agc_current_gain, 7)
+        self.assertEqual(sr.agc_peak_magnitude, 200)
+        self.assertEqual(sr.agc_saturation_count, 15)
+        self.assertEqual(sr.agc_enable, 1)
+
+    def test_agc_max_values(self):
+        """AGC fields at max values."""
+        raw = self._make_status_packet(agc_gain=15, agc_peak=255,
+                                       agc_sat=255, agc_enable=1)
+        sr = RadarProtocol.parse_status_packet(raw)
+        self.assertEqual(sr.agc_current_gain, 15)
+        self.assertEqual(sr.agc_peak_magnitude, 255)
+        self.assertEqual(sr.agc_saturation_count, 255)
+        self.assertEqual(sr.agc_enable, 1)
+
+    def test_agc_and_range_mode_coexist(self):
+        """AGC fields and range_mode occupy the same word without conflict."""
+        raw = self._make_status_packet(agc_gain=5, agc_peak=128,
+                                       agc_sat=42, agc_enable=1,
+                                       range_mode=2)
+        sr = RadarProtocol.parse_status_packet(raw)
+        self.assertEqual(sr.agc_current_gain, 5)
+        self.assertEqual(sr.agc_peak_magnitude, 128)
+        self.assertEqual(sr.agc_saturation_count, 42)
+        self.assertEqual(sr.agc_enable, 1)
+        self.assertEqual(sr.range_mode, 2)
+
+
+class TestAGCStatusResponseDefaults(unittest.TestCase):
+    """Verify StatusResponse AGC field defaults."""
+
+    def test_default_agc_fields(self):
+        sr = StatusResponse()
+        self.assertEqual(sr.agc_current_gain, 0)
+        self.assertEqual(sr.agc_peak_magnitude, 0)
+        self.assertEqual(sr.agc_saturation_count, 0)
+        self.assertEqual(sr.agc_enable, 0)
+
+    def test_agc_fields_set(self):
+        sr = StatusResponse(agc_current_gain=7, agc_peak_magnitude=200,
+                            agc_saturation_count=15, agc_enable=1)
+        self.assertEqual(sr.agc_current_gain, 7)
+        self.assertEqual(sr.agc_peak_magnitude, 200)
+        self.assertEqual(sr.agc_saturation_count, 15)
+        self.assertEqual(sr.agc_enable, 1)
 
 
 if __name__ == "__main__":

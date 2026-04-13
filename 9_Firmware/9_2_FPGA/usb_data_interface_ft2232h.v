@@ -90,7 +90,13 @@ module usb_data_interface_ft2232h (
     // Self-test status readback
     input wire [4:0]  status_self_test_flags,
     input wire [7:0]  status_self_test_detail,
-    input wire        status_self_test_busy
+    input wire        status_self_test_busy,
+
+    // AGC status readback
+    input wire [3:0]  status_agc_current_gain,
+    input wire [7:0]  status_agc_peak_magnitude,
+    input wire [7:0]  status_agc_saturation_count,
+    input wire        status_agc_enable
 );
 
 // ============================================================================
@@ -281,7 +287,12 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
             status_words[1] <= {status_long_chirp, status_long_listen};
             status_words[2] <= {status_guard, status_short_chirp};
             status_words[3] <= {status_short_listen, 10'd0, status_chirps_per_elev};
-            status_words[4] <= {30'd0, status_range_mode};
+            status_words[4] <= {status_agc_current_gain,        // [31:28]
+                                status_agc_peak_magnitude,      // [27:20]
+                                status_agc_saturation_count,    // [19:12]
+                                status_agc_enable,              // [11]
+                                9'd0,                           // [10:2] reserved
+                                status_range_mode};             // [1:0]
             status_words[5] <= {7'd0, status_self_test_busy,
                                 8'd0, status_self_test_detail,
                                 3'd0, status_self_test_flags};

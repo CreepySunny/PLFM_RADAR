@@ -125,7 +125,13 @@ module radar_system_top (
     output wire [5:0] dbg_range_bin,
     
     // System status
-    output wire [3:0] system_status
+    output wire [3:0] system_status,
+
+    // FPGA→STM32 GPIO outputs (DIG_5..DIG_7 on 50T board)
+    // Used by STM32 outer AGC loop to read saturation state without USB polling.
+    output wire gpio_dig5,          // DIG_5 (H11→PD13): AGC saturation flag (1=clipping detected)
+    output wire gpio_dig6,          // DIG_6 (G12→PD14): reserved (tied low)
+    output wire gpio_dig7           // DIG_7 (H12→PD15): reserved (tied low)
 );
 
 // ============================================================================
@@ -186,6 +192,11 @@ wire rx_frame_complete;
 wire [15:0] rx_dbg_adc_i;
 wire [15:0] rx_dbg_adc_q;
 wire        rx_dbg_adc_valid;
+
+// AGC status from receiver (for status readback and GPIO)
+wire [7:0]  rx_agc_saturation_count;
+wire [7:0]  rx_agc_peak_magnitude;
+wire [3:0]  rx_agc_current_gain;
 
 // Data packing for USB
 wire [31:0] usb_range_profile;
@@ -258,6 +269,13 @@ reg        host_cfar_enable;      // Opcode 0x25: 1=CFAR, 0=simple threshold
 // Ground clutter removal registers (host-configurable via USB)
 reg        host_mti_enable;       // Opcode 0x26: 1=MTI active, 0=pass-through
 reg [2:0]  host_dc_notch_width;   // Opcode 0x27: DC notch ±width bins (0=off, 1..7)
+
+// AGC configuration registers (host-configurable via USB, opcodes 0x28-0x2C)
+reg        host_agc_enable;       // Opcode 0x28: 0=manual gain, 1=auto AGC
+reg [7:0]  host_agc_target;       // Opcode 0x29: target peak magnitude (default 200)
+reg [3:0]  host_agc_attack;       // Opcode 0x2A: gain-down step on clipping (default 1)
+reg [3:0]  host_agc_decay;        // Opcode 0x2B: gain-up step when weak (default 1)
+reg [3:0]  host_agc_holdoff;      // Opcode 0x2C: frames to wait before gain-up (default 4)
 
 // Board bring-up self-test registers (opcode 0x30 trigger, 0x31 readback)
 reg        host_self_test_trigger;  // Opcode 0x30: self-clearing pulse
@@ -518,6 +536,12 @@ radar_receiver_final rx_inst (
     .host_chirps_per_elev(host_chirps_per_elev),
     // Fix 3: digital gain control
     .host_gain_shift(host_gain_shift),
+    // AGC configuration (opcodes 0x28-0x2C)
+    .host_agc_enable(host_agc_enable),
+    .host_agc_target(host_agc_target),
+    .host_agc_attack(host_agc_attack),
+    .host_agc_decay(host_agc_decay),
+    .host_agc_holdoff(host_agc_holdoff),
     // STM32 toggle signals for RX mode controller (mode 00 pass-through).
     // These are the raw GPIO inputs — the RX mode controller's edge detectors
     // (inside radar_mode_controller) handle debouncing/edge detection.
@@ -532,7 +556,11 @@ radar_receiver_final rx_inst (
     // ADC debug tap (for self-test / bring-up)
     .dbg_adc_i(rx_dbg_adc_i),
     .dbg_adc_q(rx_dbg_adc_q),
-    .dbg_adc_valid(rx_dbg_adc_valid)
+    .dbg_adc_valid(rx_dbg_adc_valid),
+    // AGC status outputs
+    .agc_saturation_count(rx_agc_saturation_count),
+    .agc_peak_magnitude(rx_agc_peak_magnitude),
+    .agc_current_gain(rx_agc_current_gain)
 );
 
 // ============================================================================
@@ -744,7 +772,13 @@ if (USB_MODE == 0) begin : gen_ft601
         // Self-test status readback
         .status_self_test_flags(self_test_flags_latched),
         .status_self_test_detail(self_test_detail_latched),
-        .status_self_test_busy(self_test_busy)
+        .status_self_test_busy(self_test_busy),
+
+        // AGC status readback
+        .status_agc_current_gain(rx_agc_current_gain),
+        .status_agc_peak_magnitude(rx_agc_peak_magnitude),
+        .status_agc_saturation_count(rx_agc_saturation_count),
+        .status_agc_enable(host_agc_enable)
     );
 
     // FT2232H ports unused in FT601 mode — tie off
@@ -805,7 +839,13 @@ end else begin : gen_ft2232h
         // Self-test status readback
         .status_self_test_flags(self_test_flags_latched),
         .status_self_test_detail(self_test_detail_latched),
-        .status_self_test_busy(self_test_busy)
+        .status_self_test_busy(self_test_busy),
+
+        // AGC status readback
+        .status_agc_current_gain(rx_agc_current_gain),
+        .status_agc_peak_magnitude(rx_agc_peak_magnitude),
+        .status_agc_saturation_count(rx_agc_saturation_count),
+        .status_agc_enable(host_agc_enable)
     );
 
     // FT601 ports unused in FT2232H mode — tie off
@@ -892,6 +932,12 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
         // Ground clutter removal defaults (disabled — backward-compatible)
         host_mti_enable         <= 1'b0;      // MTI off
         host_dc_notch_width     <= 3'd0;      // DC notch off
+        // AGC defaults (disabled — backward-compatible with manual gain)
+        host_agc_enable         <= 1'b0;      // AGC off (manual gain)
+        host_agc_target         <= 8'd200;    // Target peak magnitude
+        host_agc_attack         <= 4'd1;      // 1-step gain-down on clipping
+        host_agc_decay          <= 4'd1;      // 1-step gain-up when weak
+        host_agc_holdoff        <= 4'd4;      // 4 frames before gain-up
         // Self-test defaults
         host_self_test_trigger  <= 1'b0;      // Self-test idle
     end else begin
@@ -936,6 +982,12 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
                 // Ground clutter removal opcodes
                 8'h26: host_mti_enable         <= usb_cmd_value[0];
                 8'h27: host_dc_notch_width     <= usb_cmd_value[2:0];
+                // AGC configuration opcodes
+                8'h28: host_agc_enable         <= usb_cmd_value[0];
+                8'h29: host_agc_target         <= usb_cmd_value[7:0];
+                8'h2A: host_agc_attack         <= usb_cmd_value[3:0];
+                8'h2B: host_agc_decay          <= usb_cmd_value[3:0];
+                8'h2C: host_agc_holdoff        <= usb_cmd_value[3:0];
                 // Board bring-up self-test opcodes
                 8'h30: host_self_test_trigger  <= 1'b1;  // Trigger self-test
                 8'h31: host_status_request     <= 1'b1;  // Self-test readback (status alias)
@@ -977,6 +1029,16 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
 end
 
 assign system_status = status_reg;
+
+// ============================================================================
+// FPGA→STM32 GPIO OUTPUTS (DIG_5, DIG_6, DIG_7)
+// ============================================================================
+// DIG_5: AGC saturation flag — high when per-frame saturation_count > 0.
+//        STM32 reads PD13 to detect clipping and adjust ADAR1000 VGA gain.
+// DIG_6, DIG_7: Reserved (tied low for future use).
+assign gpio_dig5 = (rx_agc_saturation_count != 8'd0);
+assign gpio_dig6 = 1'b0;
+assign gpio_dig7 = 1'b0;
 
 // ============================================================================
 // DEBUG AND VERIFICATION

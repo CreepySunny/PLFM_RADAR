@@ -38,10 +38,20 @@ reg signed [15:0] data_q_in;
 reg               valid_in;
 reg [3:0]         gain_shift;
 
+// AGC configuration (default: AGC disabled — manual mode)
+reg               agc_enable;
+reg [7:0]         agc_target;
+reg [3:0]         agc_attack;
+reg [3:0]         agc_decay;
+reg [3:0]         agc_holdoff;
+reg               frame_boundary;
+
 wire signed [15:0] data_i_out;
 wire signed [15:0] data_q_out;
 wire               valid_out;
 wire [7:0]         saturation_count;
+wire [7:0]         peak_magnitude;
+wire [3:0]         current_gain;
 
 rx_gain_control dut (
     .clk(clk),
@@ -50,10 +60,18 @@ rx_gain_control dut (
     .data_q_in(data_q_in),
     .valid_in(valid_in),
     .gain_shift(gain_shift),
+    .agc_enable(agc_enable),
+    .agc_target(agc_target),
+    .agc_attack(agc_attack),
+    .agc_decay(agc_decay),
+    .agc_holdoff(agc_holdoff),
+    .frame_boundary(frame_boundary),
     .data_i_out(data_i_out),
     .data_q_out(data_q_out),
     .valid_out(valid_out),
-    .saturation_count(saturation_count)
+    .saturation_count(saturation_count),
+    .peak_magnitude(peak_magnitude),
+    .current_gain(current_gain)
 );
 
 // ---------------------------------------------------------------
@@ -105,6 +123,13 @@ initial begin
     data_q_in  = 0;
     valid_in   = 0;
     gain_shift = 4'd0;
+    // AGC disabled for backward-compatible tests (Tests 1-12)
+    agc_enable     = 0;
+    agc_target     = 8'd200;
+    agc_attack     = 4'd1;
+    agc_decay      = 4'd1;
+    agc_holdoff    = 4'd4;
+    frame_boundary = 0;
 
     repeat (4) @(posedge clk);
     reset_n = 1;
@@ -152,6 +177,9 @@ initial begin
           "T3.1: I saturated to +32767");
     check(data_q_out == -16'sd32768,
           "T3.2: Q saturated to -32768");
+    // Pulse frame_boundary to snapshot the per-frame saturation count
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
     check(saturation_count == 8'd1,
           "T3.3: Saturation counter = 1 (both channels clipped counts as 1)");
 
@@ -173,6 +201,9 @@ initial begin
           "T4.1: I attenuated 4000>>2 = 1000");
     check(data_q_out == -16'sd500,
           "T4.2: Q attenuated -2000>>2 = -500");
+    // Pulse frame_boundary to snapshot (should be 0 — no clipping)
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
     check(saturation_count == 8'd0,
           "T4.3: No saturation on right shift");
 
@@ -315,13 +346,18 @@ initial begin
     valid_in = 1'b0;
     @(posedge clk); #1;
 
+    // Pulse frame_boundary to snapshot per-frame saturation count
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
     check(saturation_count == 8'd255,
           "T11.1: Counter capped at 255 after 256 saturating samples");
 
-    // One more sample — should stay at 255
+    // One more sample + frame boundary — should still be capped at 1 (new frame)
     send_sample(16'sd20000, 16'sd20000);
-    check(saturation_count == 8'd255,
-          "T11.2: Counter stays at 255 (no wrap)");
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    check(saturation_count == 8'd1,
+          "T11.2: New frame counter = 1 (single sample)");
 
     // ---------------------------------------------------------------
     // TEST 12: Reset clears everything
@@ -329,6 +365,8 @@ initial begin
     $display("");
     $display("--- Test 12: Reset clears all ---");
 
+    gain_shift = 4'd0;  // Reset gain_shift to 0 so current_gain reads 0
+    agc_enable = 0;
     reset_n = 0;
     repeat (2) @(posedge clk);
     reset_n = 1;
@@ -342,6 +380,170 @@ initial begin
           "T12.3: valid_out cleared on reset");
     check(saturation_count == 8'd0,
           "T12.4: Saturation counter cleared on reset");
+    check(current_gain == 4'd0,
+          "T12.5: current_gain cleared on reset");
+
+    // ---------------------------------------------------------------
+    // TEST 13: current_gain reflects gain_shift in manual mode
+    // ---------------------------------------------------------------
+    $display("");
+    $display("--- Test 13: current_gain tracks gain_shift (manual) ---");
+
+    gain_shift = 4'b0_011;  // amplify x8
+    @(posedge clk); @(posedge clk); #1;
+    check(current_gain == 4'b0011,
+          "T13.1: current_gain = 0x3 (amplify x8)");
+
+    gain_shift = 4'b1_010;  // attenuate /4
+    @(posedge clk); @(posedge clk); #1;
+    check(current_gain == 4'b1010,
+          "T13.2: current_gain = 0xA (attenuate /4)");
+
+    // ---------------------------------------------------------------
+    // TEST 14: Peak magnitude tracking
+    // ---------------------------------------------------------------
+    $display("");
+    $display("--- Test 14: Peak magnitude tracking ---");
+
+    reset_n = 0;
+    repeat (2) @(posedge clk);
+    reset_n = 1;
+    repeat (2) @(posedge clk);
+
+    gain_shift = 4'b0_000;  // pass-through
+    // Send samples with increasing magnitude
+    send_sample(16'sd100, 16'sd50);
+    send_sample(16'sd1000, 16'sd500);
+    send_sample(16'sd8000, 16'sd2000);   // peak = 8000
+    send_sample(16'sd200, 16'sd100);
+    // Pulse frame_boundary to snapshot
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    // peak_magnitude = upper 8 bits of 15-bit peak (8000)
+    // 8000 = 0x1F40, 15-bit = 0x1F40, [14:7] = 0x3E = 62
+    check(peak_magnitude == 8'd62,
+          "T14.1: Peak magnitude = 62 (8000 >> 7)");
+
+    // ---------------------------------------------------------------
+    // TEST 15: AGC auto gain-down on saturation
+    // ---------------------------------------------------------------
+    $display("");
+    $display("--- Test 15: AGC gain-down on saturation ---");
+
+    reset_n = 0;
+    repeat (2) @(posedge clk);
+    reset_n = 1;
+    repeat (2) @(posedge clk);
+
+    // Start with amplify x4 (gain_shift = 0x02), then enable AGC
+    gain_shift  = 4'b0_010;  // amplify x4, internal gain = +2
+    agc_enable  = 0;
+    agc_attack  = 4'd1;
+    agc_decay   = 4'd1;
+    agc_holdoff = 4'd2;
+    agc_target  = 8'd100;
+    @(posedge clk); @(posedge clk);
+
+    // Enable AGC — should initialize from gain_shift
+    agc_enable = 1;
+    @(posedge clk); @(posedge clk); @(posedge clk); #1;
+    check(current_gain == 4'b0010,
+          "T15.1: AGC initialized from gain_shift (amplify x4)");
+
+    // Send saturating samples (will clip at x4 gain)
+    send_sample(16'sd20000, 16'sd20000);
+    send_sample(16'sd20000, 16'sd20000);
+
+    // Pulse frame_boundary — AGC should reduce gain by attack=1
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    // current_gain lags agc_gain by 1 cycle (NBA), wait one extra cycle
+    @(posedge clk); #1;
+    // Internal gain was +2, attack=1 → new gain = +1 (0x01)
+    check(current_gain == 4'b0001,
+          "T15.2: AGC reduced gain to x2 after saturation");
+
+    // Another frame with saturation (20000*2 = 40000 > 32767)
+    send_sample(16'sd20000, 16'sd20000);
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    @(posedge clk); #1;
+    // gain was +1, attack=1 → new gain = 0 (0x00)
+    check(current_gain == 4'b0000,
+          "T15.3: AGC reduced gain to x1 (pass-through)");
+
+    // At gain 0 (pass-through), 20000 does NOT overflow 16-bit range,
+    // so no saturation occurs. Signal peak = 20000 >> 7 = 156 > target(100),
+    // so AGC correctly holds gain at 0. This is expected behavior.
+    // To test crossing into attenuation: increase attack to 3.
+    agc_attack = 4'd3;
+    // Reset and start fresh with gain +2, attack=3
+    reset_n = 0;
+    repeat (2) @(posedge clk);
+    reset_n = 1;
+    repeat (2) @(posedge clk);
+
+    gain_shift = 4'b0_010;  // amplify x4, internal gain = +2
+    agc_enable = 0;
+    @(posedge clk);
+    agc_enable = 1;
+    @(posedge clk); @(posedge clk); @(posedge clk); #1;
+
+    // Send saturating samples
+    send_sample(16'sd20000, 16'sd20000);
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    @(posedge clk); #1;
+    // gain was +2, attack=3 → new gain = -1 → encoding 0x09
+    check(current_gain == 4'b1001,
+          "T15.4: Large attack step crosses to attenuation (gain +2 - 3 = -1 → 0x9)");
+
+    // ---------------------------------------------------------------
+    // TEST 16: AGC auto gain-up after holdoff
+    // ---------------------------------------------------------------
+    $display("");
+    $display("--- Test 16: AGC gain-up after holdoff ---");
+
+    reset_n = 0;
+    repeat (2) @(posedge clk);
+    reset_n = 1;
+    repeat (2) @(posedge clk);
+
+    // Start with low gain, weak signal, holdoff=2
+    gain_shift  = 4'b0_000;  // pass-through (internal gain = 0)
+    agc_enable  = 0;
+    agc_attack  = 4'd1;
+    agc_decay   = 4'd1;
+    agc_holdoff = 4'd2;
+    agc_target  = 8'd100;  // target peak = 100 (in upper 8 bits = 12800 raw)
+    @(posedge clk); @(posedge clk);
+
+    agc_enable = 1;
+    @(posedge clk); @(posedge clk); #1;
+
+    // Frame 1: send weak signal (peak < target), holdoff counter = 2
+    send_sample(16'sd100, 16'sd50);  // peak=100, [14:7]=0 (very weak)
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    @(posedge clk); #1;
+    check(current_gain == 4'b0000,
+          "T16.1: Gain held during holdoff (frame 1, holdoff=2)");
+
+    // Frame 2: still weak, holdoff counter decrements to 1
+    send_sample(16'sd100, 16'sd50);
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    @(posedge clk); #1;
+    check(current_gain == 4'b0000,
+          "T16.2: Gain held during holdoff (frame 2, holdoff=1)");
+
+    // Frame 3: holdoff expired (was 0 at start of frame) → gain up
+    send_sample(16'sd100, 16'sd50);
+    @(negedge clk); frame_boundary = 1; @(posedge clk); #1;
+    @(negedge clk); frame_boundary = 0; @(posedge clk); #1;
+    @(posedge clk); #1;
+    check(current_gain == 4'b0001,
+          "T16.3: Gain increased after holdoff expired (gain 0->1)");
 
     // ---------------------------------------------------------------
     // SUMMARY

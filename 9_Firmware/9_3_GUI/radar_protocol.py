@@ -59,9 +59,9 @@ class Opcode(IntEnum):
         0x03  host_detect_threshold  0x16  host_gain_shift
         0x04  host_stream_control    0x20  host_range_mode
         0x10  host_long_chirp_cycles 0x21-0x27  CFAR / MTI / DC-notch
-        0x11  host_long_listen_cycles 0x30  host_self_test_trigger
-        0x12  host_guard_cycles      0x31  host_status_request
-        0x13  host_short_chirp_cycles 0xFF  host_status_request
+        0x11  host_long_listen_cycles 0x28-0x2C  AGC control
+        0x12  host_guard_cycles      0x30  host_self_test_trigger
+        0x13  host_short_chirp_cycles 0x31/0xFF  host_status_request
     """
     # --- Basic control (0x01-0x04) ---
     RADAR_MODE          = 0x01  # 2-bit mode select
@@ -89,6 +89,13 @@ class Opcode(IntEnum):
     CFAR_ENABLE         = 0x25
     MTI_ENABLE          = 0x26
     DC_NOTCH_WIDTH      = 0x27
+
+    # --- AGC (0x28-0x2C) ---
+    AGC_ENABLE          = 0x28
+    AGC_TARGET          = 0x29
+    AGC_ATTACK          = 0x2A
+    AGC_DECAY           = 0x2B
+    AGC_HOLDOFF         = 0x2C
 
     # --- Board self-test / status (0x30-0x31, 0xFF) ---
     SELF_TEST_TRIGGER   = 0x30
@@ -135,6 +142,11 @@ class StatusResponse:
     self_test_flags: int = 0     # 5-bit result flags [4:0]
     self_test_detail: int = 0    # 8-bit detail code [7:0]
     self_test_busy: int = 0      # 1-bit busy flag
+    # AGC metrics (word 4, added for hybrid AGC)
+    agc_current_gain: int = 0    # 4-bit current gain encoding [3:0]
+    agc_peak_magnitude: int = 0  # 8-bit peak magnitude [7:0]
+    agc_saturation_count: int = 0  # 8-bit saturation count [7:0]
+    agc_enable: int = 0          # 1-bit AGC enable readback
 
 
 # ============================================================================
@@ -232,8 +244,13 @@ class RadarProtocol:
         # Word 3: {short_listen[31:16], 10'd0, chirps_per_elev[5:0]}
         sr.chirps_per_elev = words[3] & 0x3F
         sr.short_listen = (words[3] >> 16) & 0xFFFF
-        # Word 4: {30'd0, range_mode[1:0]}
+        # Word 4: {agc_current_gain[31:28], agc_peak_magnitude[27:20],
+        #          agc_saturation_count[19:12], agc_enable[11], 9'd0, range_mode[1:0]}
         sr.range_mode = words[4] & 0x03
+        sr.agc_enable = (words[4] >> 11) & 0x01
+        sr.agc_saturation_count = (words[4] >> 12) & 0xFF
+        sr.agc_peak_magnitude = (words[4] >> 20) & 0xFF
+        sr.agc_current_gain = (words[4] >> 28) & 0x0F
         # Word 5: {7'd0, self_test_busy, 8'd0, self_test_detail[7:0],
         #           3'd0, self_test_flags[4:0]}
         sr.self_test_flags = words[5] & 0x1F

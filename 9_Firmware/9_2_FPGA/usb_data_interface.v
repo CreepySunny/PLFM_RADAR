@@ -77,7 +77,13 @@ module usb_data_interface (
     // Self-test status readback (opcode 0x31 / included in 0xFF status packet)
     input wire [4:0]  status_self_test_flags,  // Per-test PASS(1)/FAIL(0) latched
     input wire [7:0]  status_self_test_detail, // Diagnostic detail byte latched
-    input wire        status_self_test_busy    // Self-test FSM still running
+    input wire        status_self_test_busy,   // Self-test FSM still running
+
+    // AGC status readback
+    input wire [3:0]  status_agc_current_gain,
+    input wire [7:0]  status_agc_peak_magnitude,
+    input wire [7:0]  status_agc_saturation_count,
+    input wire        status_agc_enable
 );
 
 // USB packet structure (same as before)
@@ -267,8 +273,13 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
             status_words[2] <= {status_guard, status_short_chirp};
             // Word 3: {short_listen_cycles[15:0], chirps_per_elev[5:0], 10'b0}
             status_words[3] <= {status_short_listen, 10'd0, status_chirps_per_elev};
-            // Word 4: Fix 7 — range_mode in bits [1:0], rest reserved
-            status_words[4] <= {30'd0, status_range_mode};
+            // Word 4: AGC metrics + range_mode
+            status_words[4] <= {status_agc_current_gain,        // [31:28]
+                                status_agc_peak_magnitude,      // [27:20]
+                                status_agc_saturation_count,    // [19:12]
+                                status_agc_enable,              // [11]
+                                9'd0,                           // [10:2] reserved
+                                status_range_mode};             // [1:0]
             // Word 5: Self-test results {reserved[6:0], busy, reserved[7:0], detail[7:0], reserved[2:0], flags[4:0]}
             status_words[5] <= {7'd0, status_self_test_busy,
                                 8'd0, status_self_test_detail,

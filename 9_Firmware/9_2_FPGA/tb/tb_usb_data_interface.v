@@ -79,6 +79,12 @@ module tb_usb_data_interface;
     reg  [7:0]  status_self_test_detail;
     reg         status_self_test_busy;
 
+    // AGC status readback inputs
+    reg  [3:0]  status_agc_current_gain;
+    reg  [7:0]  status_agc_peak_magnitude;
+    reg  [7:0]  status_agc_saturation_count;
+    reg         status_agc_enable;
+
     // ── Clock generators (asynchronous) ────────────────────────
     always #(CLK_PERIOD / 2) clk = ~clk;
     always #(FT_CLK_PERIOD / 2) ft601_clk_in = ~ft601_clk_in;
@@ -134,7 +140,13 @@ module tb_usb_data_interface;
         // Self-test status readback
         .status_self_test_flags (status_self_test_flags),
         .status_self_test_detail(status_self_test_detail),
-        .status_self_test_busy  (status_self_test_busy)
+        .status_self_test_busy  (status_self_test_busy),
+
+        // AGC status readback
+        .status_agc_current_gain    (status_agc_current_gain),
+        .status_agc_peak_magnitude  (status_agc_peak_magnitude),
+        .status_agc_saturation_count(status_agc_saturation_count),
+        .status_agc_enable          (status_agc_enable)
     );
 
     // ── Test bookkeeping ───────────────────────────────────────
@@ -194,6 +206,10 @@ module tb_usb_data_interface;
             status_self_test_flags  = 5'b00000;
             status_self_test_detail = 8'd0;
             status_self_test_busy   = 1'b0;
+            status_agc_current_gain     = 4'd0;
+            status_agc_peak_magnitude   = 8'd0;
+            status_agc_saturation_count = 8'd0;
+            status_agc_enable           = 1'b0;
             repeat (6) @(posedge ft601_clk_in);
             reset_n = 1;
             // Wait enough cycles for stream_control CDC to propagate
@@ -902,6 +918,11 @@ module tb_usb_data_interface;
         status_self_test_flags  = 5'b11111;
         status_self_test_detail = 8'hA5;
         status_self_test_busy   = 1'b0;
+        // AGC status: gain=5, peak=180, sat_count=12, enabled
+        status_agc_current_gain     = 4'd5;
+        status_agc_peak_magnitude   = 8'd180;
+        status_agc_saturation_count = 8'd12;
+        status_agc_enable           = 1'b1;
 
         // Pulse status_request (1 cycle in clk domain — toggles status_req_toggle_100m)
         @(posedge clk);
@@ -958,8 +979,8 @@ module tb_usb_data_interface;
               "Status readback: word 2 = {guard, short_chirp}");
         check(uut.status_words[3] === {16'd17450, 10'd0, 6'd32},
               "Status readback: word 3 = {short_listen, 0, chirps_per_elev}");
-        check(uut.status_words[4] === {30'd0, 2'b10},
-              "Status readback: word 4 = range_mode=2'b10");
+        check(uut.status_words[4] === {4'd5, 8'd180, 8'd12, 1'b1, 9'd0, 2'b10},
+              "Status readback: word 4 = {agc_gain=5, peak=180, sat=12, en=1, range_mode=2}");
         // status_words[5] = {7'd0, busy, 8'd0, detail[7:0], 3'd0, flags[4:0]}
         // = {7'd0, 1'b0, 8'd0, 8'hA5, 3'd0, 5'b11111}
         check(uut.status_words[5] === {7'd0, 1'b0, 8'd0, 8'hA5, 3'd0, 5'b11111},

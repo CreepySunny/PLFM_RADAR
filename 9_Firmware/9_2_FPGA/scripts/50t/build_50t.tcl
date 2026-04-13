@@ -120,9 +120,10 @@ set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {ft_clkout_IBUF}]
 
 # ---- Run implementation steps ----
 opt_design -directive Explore
-place_design -directive Explore
+place_design -directive ExtraNetDelay_high
 phys_opt_design -directive AggressiveExplore
-route_design -directive Explore
+route_design -directive AggressiveExplore
+phys_opt_design -directive AggressiveExplore
 phys_opt_design -directive AggressiveExplore
 
 set impl_elapsed [expr {[clock seconds] - $impl_start}]

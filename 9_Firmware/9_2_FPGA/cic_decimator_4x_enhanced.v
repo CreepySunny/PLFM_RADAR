@@ -66,13 +66,13 @@ reg signed [COMB_WIDTH-1:0] comb_delay [0:STAGES-1][0:COMB_DELAY-1];
 // Pipeline valid for comb stages 1-4: delayed by 1 cycle vs comb_pipe to
 // account for CREG+AREG+BREG pipeline inside comb_0_dsp (explicit DSP48E1).
 // Comb[0] result appears 1 cycle after data_valid_comb_pipe.
-(* keep = "true", max_fanout = 4 *) reg data_valid_comb_0_out;
+(* keep = "true", max_fanout = 16 *) reg data_valid_comb_0_out;
 
 // Enhanced control and monitoring
 reg [1:0] decimation_counter;
-(* keep = "true", max_fanout = 4 *) reg data_valid_delayed;
-(* keep = "true", max_fanout = 4 *) reg data_valid_comb;
-(* keep = "true", max_fanout = 4 *) reg data_valid_comb_pipe;
+(* keep = "true", max_fanout = 16 *) reg data_valid_delayed;
+(* keep = "true", max_fanout = 16 *) reg data_valid_comb;
+(* keep = "true", max_fanout = 16 *) reg data_valid_comb_pipe;
 reg [7:0] output_counter;
 reg [ACC_WIDTH-1:0] max_integrator_value;
 reg overflow_detected;

@@ -222,8 +222,16 @@ set_property IOSTANDARD LVCMOS33 [get_ports {stm32_new_*}]
 set_property IOSTANDARD LVCMOS33 [get_ports {stm32_mixers_enable}]
 # reset_n is DIG_4 (PD12) — constrained above in the RESET section
 
-# DIG_5 = H11, DIG_6 = G12, DIG_7 = H12 — available for FPGA→STM32 status
-# Currently unused in RTL. Could be connected to status outputs if needed.
+# DIG_5 = H11, DIG_6 = G12, DIG_7 = H12 — FPGA→STM32 status outputs
+# DIG_5: AGC saturation flag (PD13 on STM32)
+# DIG_6: reserved (PD14)
+# DIG_7: reserved (PD15)
+set_property PACKAGE_PIN H11 [get_ports {gpio_dig5}]
+set_property PACKAGE_PIN G12 [get_ports {gpio_dig6}]
+set_property PACKAGE_PIN H12 [get_ports {gpio_dig7}]
+set_property IOSTANDARD LVCMOS33 [get_ports {gpio_dig*}]
+set_property DRIVE 8 [get_ports {gpio_dig*}]
+set_property SLEW SLOW [get_ports {gpio_dig*}]
 
 # ============================================================================
 # ADC INTERFACE (LVDS — Bank 14, VCCO=3.3V)

@@ -100,6 +100,11 @@ GROUND_TRUTH_OPCODES = {
     0x25: ("host_cfar_enable", 1),
     0x26: ("host_mti_enable", 1),
     0x27: ("host_dc_notch_width", 3),
+    0x28: ("host_agc_enable", 1),
+    0x29: ("host_agc_target", 8),
+    0x2A: ("host_agc_attack", 4),
+    0x2B: ("host_agc_decay", 4),
+    0x2C: ("host_agc_holdoff", 4),
     0x30: ("host_self_test_trigger", 1),  # pulse
     0x31: ("host_status_request", 1),     # pulse
     0xFF: ("host_status_request", 1),     # alias, pulse
@@ -124,6 +129,11 @@ GROUND_TRUTH_RESET_DEFAULTS = {
     "host_cfar_enable": 0,
     "host_mti_enable": 0,
     "host_dc_notch_width": 0,
+    "host_agc_enable": 0,
+    "host_agc_target": 200,
+    "host_agc_attack": 1,
+    "host_agc_decay": 1,
+    "host_agc_holdoff": 4,
 }
 
 GROUND_TRUTH_PACKET_CONSTANTS = {
@@ -604,6 +614,10 @@ class TestTier2VerilogCosim:
         #   status_self_test_flags = 5'b10101 = 21
         #   status_self_test_detail = 0xA5
         #   status_self_test_busy = 1
+        #   status_agc_current_gain = 7
+        #   status_agc_peak_magnitude = 200
+        #   status_agc_saturation_count = 15
+        #   status_agc_enable = 1
 
         # Words 1-5 should be correct (no truncation bug)
         assert sr.cfar_threshold == 0xABCD, f"cfar_threshold: 0x{sr.cfar_threshold:04X}"
@@ -617,6 +631,12 @@ class TestTier2VerilogCosim:
         assert sr.self_test_flags == 21, f"self_test_flags: {sr.self_test_flags}"
         assert sr.self_test_detail == 0xA5, f"self_test_detail: 0x{sr.self_test_detail:02X}"
         assert sr.self_test_busy == 1, f"self_test_busy: {sr.self_test_busy}"
+
+        # AGC fields (word 4)
+        assert sr.agc_current_gain == 7, f"agc_current_gain: {sr.agc_current_gain}"
+        assert sr.agc_peak_magnitude == 200, f"agc_peak_magnitude: {sr.agc_peak_magnitude}"
+        assert sr.agc_saturation_count == 15, f"agc_saturation_count: {sr.agc_saturation_count}"
+        assert sr.agc_enable == 1, f"agc_enable: {sr.agc_enable}"
 
         # Word 0: stream_ctrl should be 5 (3'b101)
         assert sr.stream_ctrl == 5, (

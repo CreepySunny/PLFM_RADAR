@@ -527,6 +527,8 @@ def parse_verilog_status_word_concats(
     ):
         idx = int(m.group(1))
         expr = m.group(2)
+        # Strip single-line comments before normalizing whitespace
+        expr = re.sub(r'//[^\n]*', '', expr)
         # Normalize whitespace
         expr = re.sub(r'\s+', ' ', expr).strip()
         results[idx] = expr

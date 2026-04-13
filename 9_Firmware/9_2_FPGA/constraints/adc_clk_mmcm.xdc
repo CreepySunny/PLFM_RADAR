@@ -83,3 +83,12 @@ set_false_path -through [get_pins rx_inst/adc/mmcm_inst/mmcm_adc_400m/LOCKED]
 # Waiving hold on these 8 paths (adc_d_p[0..7] → IDDR) is standard practice
 # for source-synchronous LVDS ADC interfaces using BUFIO capture.
 set_false_path -hold -from [get_ports {adc_d_p[*]}] -to [get_clocks adc_dco_p]
+
+# --------------------------------------------------------------------------
+# Timing margin for 400 MHz CIC critical path
+# --------------------------------------------------------------------------
+# The CIC decimator at 400 MHz has near-zero margin (WNS = +0.001 ns in
+# Build 26). Adding 200 ps of extra setup uncertainty forces Vivado to
+# leave comfortable margin for temperature/voltage/aging variation.
+# This is additive to the existing jitter-based uncertainty (~53 ps).
+set_clock_uncertainty -setup -add 0.200 [get_clocks clk_mmcm_out0]

@@ -379,6 +379,44 @@ class RadarDashboard:
                    command=lambda: self._send_cmd(0x25, 0)).pack(
                        side="left", expand=True, fill="x", padx=(2, 0))
 
+        # ── AGC (Automatic Gain Control) ──────────────────────────────
+        grp_agc = ttk.LabelFrame(right, text="AGC (Auto Gain)", padding=10)
+        grp_agc.pack(fill="x", pady=(0, 8))
+
+        agc_params = [
+            ("AGC Enable",   0x28, "0",   1, "0=manual, 1=auto"),
+            ("AGC Target",   0x29, "200", 8, "0-255, peak target"),
+            ("AGC Attack",   0x2A, "1",   4, "0-15, atten step"),
+            ("AGC Decay",    0x2B, "1",   4, "0-15, gain-up step"),
+            ("AGC Holdoff",  0x2C, "4",   4, "0-15, frames"),
+        ]
+        for label, opcode, default, bits, hint in agc_params:
+            self._add_param_row(grp_agc, label, opcode, default, bits, hint)
+
+        # AGC quick toggle
+        agc_row = ttk.Frame(grp_agc)
+        agc_row.pack(fill="x", pady=2)
+        ttk.Button(agc_row, text="Enable AGC",
+                   command=lambda: self._send_cmd(0x28, 1)).pack(
+                       side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(agc_row, text="Disable AGC",
+                   command=lambda: self._send_cmd(0x28, 0)).pack(
+                       side="left", expand=True, fill="x", padx=(2, 0))
+
+        # AGC status readback labels
+        agc_st = ttk.LabelFrame(grp_agc, text="AGC Status", padding=6)
+        agc_st.pack(fill="x", pady=(4, 0))
+        self._agc_labels = {}
+        for name, default_text in [
+            ("enable", "AGC: --"),
+            ("gain",   "Gain: --"),
+            ("peak",   "Peak: --"),
+            ("sat",    "Sat Count: --"),
+        ]:
+            lbl = ttk.Label(agc_st, text=default_text, font=("Menlo", 9))
+            lbl.pack(anchor="w")
+            self._agc_labels[name] = lbl
+
         # ── Custom Command (advanced / debug) ─────────────────────────
         grp_cust = ttk.LabelFrame(right, text="Custom Command", padding=10)
         grp_cust.pack(fill="x", pady=(0, 8))
@@ -521,7 +559,7 @@ class RadarDashboard:
         self.root.after(0, self._update_self_test_labels, status)
 
     def _update_self_test_labels(self, status: StatusResponse):
-        """Update the self-test result labels from a StatusResponse."""
+        """Update the self-test result labels and AGC status from a StatusResponse."""
         if not hasattr(self, '_st_labels'):
             return
         flags = status.self_test_flags
@@ -555,6 +593,21 @@ class RadarDashboard:
                 color = RED
             self._st_labels[key].config(
                 text=f"{name}: {result_str}", foreground=color)
+
+        # AGC status readback
+        if hasattr(self, '_agc_labels'):
+            agc_str = "AUTO" if status.agc_enable else "MANUAL"
+            agc_color = GREEN if status.agc_enable else FG
+            self._agc_labels["enable"].config(
+                text=f"AGC: {agc_str}", foreground=agc_color)
+            self._agc_labels["gain"].config(
+                text=f"Gain: {status.agc_current_gain}")
+            self._agc_labels["peak"].config(
+                text=f"Peak: {status.agc_peak_magnitude}")
+            sat_color = RED if status.agc_saturation_count > 0 else FG
+            self._agc_labels["sat"].config(
+                text=f"Sat Count: {status.agc_saturation_count}",
+                foreground=sat_color)
 
     # --------------------------------------------------------- Display loop
     def _schedule_update(self):

@@ -86,6 +86,10 @@ module tb_cross_layer_ft2232h;
     reg  [4:0]  status_self_test_flags;
     reg  [7:0]  status_self_test_detail;
     reg         status_self_test_busy;
+    reg  [3:0]  status_agc_current_gain;
+    reg  [7:0]  status_agc_peak_magnitude;
+    reg  [7:0]  status_agc_saturation_count;
+    reg         status_agc_enable;
 
     // ---- Clock generators ----
     always #(CLK_PERIOD / 2)    clk    = ~clk;
@@ -130,7 +134,11 @@ module tb_cross_layer_ft2232h;
         .status_range_mode      (status_range_mode),
         .status_self_test_flags (status_self_test_flags),
         .status_self_test_detail(status_self_test_detail),
-        .status_self_test_busy  (status_self_test_busy)
+        .status_self_test_busy  (status_self_test_busy),
+        .status_agc_current_gain    (status_agc_current_gain),
+        .status_agc_peak_magnitude  (status_agc_peak_magnitude),
+        .status_agc_saturation_count(status_agc_saturation_count),
+        .status_agc_enable          (status_agc_enable)
     );
 
     // ---- Test bookkeeping ----
@@ -188,6 +196,10 @@ module tb_cross_layer_ft2232h;
             status_self_test_flags  = 5'b00000;
             status_self_test_detail = 8'd0;
             status_self_test_busy   = 1'b0;
+            status_agc_current_gain     = 4'd0;
+            status_agc_peak_magnitude   = 8'd0;
+            status_agc_saturation_count = 8'd0;
+            status_agc_enable           = 1'b0;
             repeat (6) @(posedge ft_clk);
             reset_n    = 1;
             ft_reset_n = 1;
@@ -605,6 +617,10 @@ module tb_cross_layer_ft2232h;
         status_self_test_flags  = 5'b10101;
         status_self_test_detail = 8'hA5;
         status_self_test_busy   = 1'b1;
+        status_agc_current_gain     = 4'd7;
+        status_agc_peak_magnitude   = 8'd200;
+        status_agc_saturation_count = 8'd15;
+        status_agc_enable           = 1'b1;
 
         // Pulse status_request and capture bytes IN PARALLEL
         // (same reason as Exercise B — write FSM starts before CDC wait ends)

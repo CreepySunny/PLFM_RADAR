@@ -76,7 +76,12 @@ module radar_system_top_50t (
     output wire ft_rd_n,              // Read strobe (active low)
     output wire ft_wr_n,              // Write strobe (active low)
     output wire ft_oe_n,              // Output enable / bus direction
-    output wire ft_siwu               // Send Immediate / WakeUp
+    output wire ft_siwu,              // Send Immediate / WakeUp
+
+    // ===== FPGA→STM32 GPIO (Bank 15: 3.3V) =====
+    output wire gpio_dig5,            // DIG_5 (H11→PD13): AGC saturation flag
+    output wire gpio_dig6,            // DIG_6 (G12→PD14): reserved
+    output wire gpio_dig7             // DIG_7 (H12→PD15): reserved
 );
 
     // ===== Tie-off wires for unconstrained FT601 inputs (inactive with USB_MODE=1) =====
@@ -207,7 +212,12 @@ module radar_system_top_50t (
         .dbg_doppler_valid      (dbg_doppler_valid_nc),
         .dbg_doppler_bin        (dbg_doppler_bin_nc),
         .dbg_range_bin          (dbg_range_bin_nc),
-        .system_status          (system_status_nc)
+        .system_status          (system_status_nc),
+
+        // ----- FPGA→STM32 GPIO (DIG_5..DIG_7) -----
+        .gpio_dig5              (gpio_dig5),
+        .gpio_dig6              (gpio_dig6),
+        .gpio_dig7              (gpio_dig7)
     );
 
 endmodule

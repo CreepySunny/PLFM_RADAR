@@ -5,7 +5,7 @@ RadarDashboard is a QMainWindow with five tabs:
   1. Main View   — Range-Doppler matplotlib canvas (64x32), device combos,
                    Start/Stop, targets table
   2. Map View    — Embedded Leaflet map + sidebar
-  3. FPGA Control — Full FPGA register control panel (all 22 opcodes,
+  3. FPGA Control — Full FPGA register control panel (all 27 opcodes incl. AGC,
                     bit-width validation, grouped layout matching production)
   4. Diagnostics — Connection indicators, packet stats, dependency status,
                    self-test results, log viewer
@@ -681,6 +681,48 @@ class RadarDashboard(QMainWindow):
 
         right_layout.addWidget(grp_cfar)
 
+        # ── AGC (Automatic Gain Control) ──────────────────────────────
+        grp_agc = QGroupBox("AGC (Auto Gain)")
+        agc_layout = QVBoxLayout(grp_agc)
+
+        agc_params = [
+            ("AGC Enable",  0x28,   0,  1, "0=manual, 1=auto"),
+            ("AGC Target",  0x29, 200,  8, "0-255, peak target"),
+            ("AGC Attack",  0x2A,   1,  4, "0-15, atten step"),
+            ("AGC Decay",   0x2B,   1,  4, "0-15, gain-up step"),
+            ("AGC Holdoff", 0x2C,   4,  4, "0-15, frames"),
+        ]
+        for label, opcode, default, bits, hint in agc_params:
+            self._add_fpga_param_row(agc_layout, label, opcode, default, bits, hint)
+
+        # AGC quick toggles
+        agc_row = QHBoxLayout()
+        btn_agc_on = QPushButton("Enable AGC")
+        btn_agc_on.clicked.connect(lambda: self._send_fpga_cmd(0x28, 1))
+        agc_row.addWidget(btn_agc_on)
+        btn_agc_off = QPushButton("Disable AGC")
+        btn_agc_off.clicked.connect(lambda: self._send_fpga_cmd(0x28, 0))
+        agc_row.addWidget(btn_agc_off)
+        agc_layout.addLayout(agc_row)
+
+        # AGC status readback labels
+        agc_st_group = QGroupBox("AGC Status")
+        agc_st_layout = QVBoxLayout(agc_st_group)
+        self._agc_labels: dict[str, QLabel] = {}
+        for name, default_text in [
+            ("enable", "AGC: --"),
+            ("gain",   "Gain: --"),
+            ("peak",   "Peak: --"),
+            ("sat",    "Sat Count: --"),
+        ]:
+            lbl = QLabel(default_text)
+            lbl.setStyleSheet(f"color: {DARK_INFO}; font-size: 10px;")
+            agc_st_layout.addWidget(lbl)
+            self._agc_labels[name] = lbl
+        agc_layout.addWidget(agc_st_group)
+
+        right_layout.addWidget(grp_agc)
+
         # Custom Command
         grp_custom = QGroupBox("Custom Command")
         cust_layout = QGridLayout(grp_custom)
@@ -1275,6 +1317,23 @@ class RadarDashboard(QMainWindow):
                 f"T3 Arith: {'PASS' if flags & 0x08 else 'FAIL'}")
             self._st_labels["t4"].setText(
                 f"T4 ADC:  {'PASS' if flags & 0x10 else 'FAIL'}")
+
+        # AGC status readback
+        if hasattr(self, '_agc_labels'):
+            agc_str = "AUTO" if st.agc_enable else "MANUAL"
+            agc_color = DARK_SUCCESS if st.agc_enable else DARK_INFO
+            self._agc_labels["enable"].setStyleSheet(
+                f"color: {agc_color}; font-weight: bold;")
+            self._agc_labels["enable"].setText(f"AGC: {agc_str}")
+            self._agc_labels["gain"].setText(
+                f"Gain: {st.agc_current_gain}")
+            self._agc_labels["peak"].setText(
+                f"Peak: {st.agc_peak_magnitude}")
+            sat_color = DARK_ERROR if st.agc_saturation_count > 0 else DARK_INFO
+            self._agc_labels["sat"].setStyleSheet(
+                f"color: {sat_color}; font-weight: bold;")
+            self._agc_labels["sat"].setText(
+                f"Sat Count: {st.agc_saturation_count}")
 
     # =====================================================================
     # Position / coverage callbacks (map sidebar)
