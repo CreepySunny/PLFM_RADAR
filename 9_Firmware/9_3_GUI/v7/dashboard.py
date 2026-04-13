@@ -25,6 +25,7 @@ commands sent over FT2232H.
 import time
 import logging
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 
@@ -59,8 +60,10 @@ from .hardware import (
     DataRecorder,
     STM32USBInterface,
 )
-from .processing import RadarProcessor, USBPacketParser
-from .workers import RadarDataWorker, GPSDataWorker, TargetSimulator
+from .processing import RadarProcessor, USBPacketParser, RawIQFrameProcessor
+from .workers import RadarDataWorker, RawIQReplayWorker, GPSDataWorker, TargetSimulator
+from .raw_iq_replay import RawIQReplayController, PlaybackState
+from .agc_sim import AGCConfig
 from .map_widget import RadarMapWidget
 
 logger = logging.getLogger(__name__)
@@ -75,19 +78,29 @@ NUM_DOPPLER_BINS = 32
 # =============================================================================
 
 class RangeDopplerCanvas(FigureCanvasQTAgg):
-    """Matplotlib canvas showing the 64x32 Range-Doppler map with dark theme."""
+    """Matplotlib canvas showing a Range-Doppler map with dark theme.
+
+    Adapts dynamically to incoming frame dimensions (e.g. 64x32 from FPGA,
+    or different sizes from Raw IQ Replay).
+    """
 
     def __init__(self, _parent=None):
         fig = Figure(figsize=(10, 6), facecolor=DARK_BG)
         self.ax = fig.add_subplot(111, facecolor=DARK_ACCENT)
 
-        self._data = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS))
+        # Initial backing data — will resize on first update_map call
+        self._n_range = NUM_RANGE_BINS
+        self._n_doppler = NUM_DOPPLER_BINS
+        self._data = np.zeros((self._n_range, self._n_doppler))
         self.im = self.ax.imshow(
             self._data, aspect="auto", cmap="hot",
-            extent=[0, NUM_DOPPLER_BINS, 0, NUM_RANGE_BINS], origin="lower",
+            extent=[0, self._n_doppler, 0, self._n_range], origin="lower",
         )
 
-        self.ax.set_title("Range-Doppler Map (64x32)", color=DARK_FG)
+        self.ax.set_title(
+            f"Range-Doppler Map ({self._n_range}x{self._n_doppler})",
+            color=DARK_FG,
+        )
         self.ax.set_xlabel("Doppler Bin", color=DARK_FG)
         self.ax.set_ylabel("Range Bin", color=DARK_FG)
         self.ax.tick_params(colors=DARK_FG)
@@ -98,7 +111,20 @@ class RangeDopplerCanvas(FigureCanvasQTAgg):
         super().__init__(fig)
 
     def update_map(self, magnitude: np.ndarray, _detections: np.ndarray = None):
-        """Update the heatmap with new magnitude data."""
+        """Update the heatmap with new magnitude data.
+
+        Automatically resizes the canvas if the incoming shape differs from
+        the current backing array.
+        """
+        nr, nd = magnitude.shape
+        if nr != self._n_range or nd != self._n_doppler:
+            self._n_range = nr
+            self._n_doppler = nd
+            self._data = np.zeros((nr, nd))
+            self.im.set_extent([0, nd, 0, nr])
+            self.ax.set_title(
+                f"Range-Doppler Map ({nr}x{nd})", color=DARK_FG)
+
         display = np.log10(magnitude + 1)
         self.im.set_data(display)
         self.im.set_clim(vmin=display.min(), vmax=max(display.max(), 0.1))
@@ -141,6 +167,11 @@ class RadarDashboard(QMainWindow):
         self._radar_worker: RadarDataWorker | None = None
         self._gps_worker: GPSDataWorker | None = None
         self._simulator: TargetSimulator | None = None
+
+        # Raw IQ Replay
+        self._replay_controller: RawIQReplayController | None = None
+        self._replay_worker: RawIQReplayWorker | None = None
+        self._iq_processor: RawIQFrameProcessor | None = None
 
         # State
         self._running = False
@@ -341,7 +372,8 @@ class RadarDashboard(QMainWindow):
         # Row 0: connection mode + device combos + buttons
         ctrl_layout.addWidget(QLabel("Mode:"), 0, 0)
         self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["Mock", "Live FT2232H", "Replay (.npy)"])
+        self._mode_combo.addItems([
+            "Mock", "Live FT2232H", "Replay (.npy)", "Raw IQ Replay (.npy)"])
         self._mode_combo.setCurrentIndex(0)
         ctrl_layout.addWidget(self._mode_combo, 0, 1)
 
@@ -389,6 +421,55 @@ class RadarDashboard(QMainWindow):
         self._status_label_main = QLabel("Status: Ready")
         self._status_label_main.setAlignment(Qt.AlignmentFlag.AlignRight)
         ctrl_layout.addWidget(self._status_label_main, 1, 5, 1, 5)
+
+        # Row 2: Raw IQ playback controls (hidden until Raw IQ mode active)
+        self._playback_frame = QFrame()
+        self._playback_frame.setStyleSheet(
+            f"background-color: {DARK_HIGHLIGHT}; border-radius: 4px;")
+        pb_layout = QHBoxLayout(self._playback_frame)
+        pb_layout.setContentsMargins(8, 4, 8, 4)
+
+        self._pb_play_btn = QPushButton("Play")
+        self._pb_play_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {DARK_SUCCESS}; color: white; }}")
+        self._pb_play_btn.clicked.connect(self._pb_play_pause)
+        pb_layout.addWidget(self._pb_play_btn)
+
+        self._pb_step_btn = QPushButton("Step")
+        self._pb_step_btn.clicked.connect(self._pb_step)
+        pb_layout.addWidget(self._pb_step_btn)
+
+        self._pb_stop_btn = QPushButton("Stop")
+        self._pb_stop_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {DARK_ERROR}; color: white; }}")
+        self._pb_stop_btn.clicked.connect(self._stop_radar)
+        pb_layout.addWidget(self._pb_stop_btn)
+
+        pb_layout.addWidget(QLabel("FPS:"))
+        self._pb_fps_spin = QDoubleSpinBox()
+        self._pb_fps_spin.setRange(0.1, 60.0)
+        self._pb_fps_spin.setValue(10.0)
+        self._pb_fps_spin.setSingleStep(1.0)
+        self._pb_fps_spin.valueChanged.connect(self._pb_fps_changed)
+        pb_layout.addWidget(self._pb_fps_spin)
+
+        self._pb_loop_check = QCheckBox("Loop")
+        self._pb_loop_check.setChecked(True)
+        self._pb_loop_check.toggled.connect(self._pb_loop_changed)
+        pb_layout.addWidget(self._pb_loop_check)
+
+        self._pb_frame_label = QLabel("Frame: 0 / 0")
+        self._pb_frame_label.setStyleSheet(
+            f"color: {DARK_INFO}; font-weight: bold;")
+        pb_layout.addWidget(self._pb_frame_label)
+
+        self._pb_file_label = QLabel("")
+        self._pb_file_label.setStyleSheet(f"color: {DARK_TEXT}; font-size: 10px;")
+        pb_layout.addWidget(self._pb_file_label)
+
+        pb_layout.addStretch()
+        self._playback_frame.setVisible(False)
+        ctrl_layout.addWidget(self._playback_frame, 2, 0, 1, 10)
 
         layout.addWidget(ctrl)
 
@@ -1194,6 +1275,10 @@ class RadarDashboard(QMainWindow):
         try:
             mode = self._mode_combo.currentText()
 
+            if "Raw IQ" in mode:
+                self._start_raw_iq_replay()
+                return
+
             if "Mock" in mode:
                 self._connection = FT2232HConnection(mock=True)
                 if not self._connection.open():
@@ -1271,6 +1356,16 @@ class RadarDashboard(QMainWindow):
             self._radar_worker.wait(2000)
             self._radar_worker = None
 
+        # Raw IQ Replay cleanup
+        if self._replay_controller is not None:
+            self._replay_controller.stop()
+        if self._replay_worker is not None:
+            self._replay_worker.stop()
+            self._replay_worker.wait(2000)
+            self._replay_worker = None
+        self._replay_controller = None
+        self._iq_processor = None
+
         if self._gps_worker:
             self._gps_worker.stop()
             self._gps_worker.wait(2000)
@@ -1285,10 +1380,161 @@ class RadarDashboard(QMainWindow):
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._mode_combo.setEnabled(True)
+        self._playback_frame.setVisible(False)
         self._status_label_main.setText("Status: Radar stopped")
         self._sb_status.setText("Radar stopped")
         self._sb_mode.setText("Idle")
         logger.info("Radar system stopped")
+
+    # =====================================================================
+    # Raw IQ Replay
+    # =====================================================================
+
+    def _start_raw_iq_replay(self):
+        """Start raw IQ replay mode: load .npy file and begin playback."""
+        from PyQt6.QtWidgets import QFileDialog
+
+        npy_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Raw IQ .npy file", "",
+            "NumPy files (*.npy);;All files (*)")
+        if not npy_path:
+            return
+
+        try:
+            # Create controller and load file
+            self._replay_controller = RawIQReplayController()
+            info = self._replay_controller.load_file(npy_path)
+
+            # Create frame processor
+            self._iq_processor = RawIQFrameProcessor(
+                n_range_out=min(64, info.n_samples),
+                n_doppler_out=min(32, info.n_chirps),
+            )
+
+            # Apply current AGC settings from FPGA Control tab
+            agc_enable = self._param_spins.get("0x28")
+            agc_target = self._param_spins.get("0x29")
+            agc_attack = self._param_spins.get("0x2A")
+            agc_decay = self._param_spins.get("0x2B")
+            agc_holdoff = self._param_spins.get("0x2C")
+            self._iq_processor.set_agc_config(AGCConfig(
+                enabled=bool(agc_enable.value()) if agc_enable else False,
+                target=agc_target.value() if agc_target else 200,
+                attack=agc_attack.value() if agc_attack else 1,
+                decay=agc_decay.value() if agc_decay else 1,
+                holdoff=agc_holdoff.value() if agc_holdoff else 4,
+            ))
+
+            # Apply CFAR settings
+            cfar_en = self._param_spins.get("0x25")
+            cfar_guard = self._param_spins.get("0x21")
+            cfar_train = self._param_spins.get("0x22")
+            cfar_alpha = self._param_spins.get("0x23")
+            cfar_mode = self._param_spins.get("0x24")
+            self._iq_processor.set_cfar_params(
+                enabled=bool(cfar_en.value()) if cfar_en else False,
+                guard=cfar_guard.value() if cfar_guard else 2,
+                train=cfar_train.value() if cfar_train else 8,
+                alpha_q44=cfar_alpha.value() if cfar_alpha else 0x30,
+                mode=cfar_mode.value() if cfar_mode else 0,
+            )
+
+            # Apply MTI / DC notch
+            mti_en = self._param_spins.get("0x26")
+            dc_notch = self._param_spins.get("0x27")
+            self._iq_processor.set_mti_enabled(
+                bool(mti_en.value()) if mti_en else False)
+            self._iq_processor.set_dc_notch_width(
+                dc_notch.value() if dc_notch else 0)
+
+            # Threshold
+            thresh = self._param_spins.get("0x03")
+            self._iq_processor.set_detect_threshold(
+                thresh.value() if thresh else 10000)
+
+            # Create worker
+            self._replay_worker = RawIQReplayWorker(
+                controller=self._replay_controller,
+                processor=self._iq_processor,
+                host_processor=self._processor,
+                settings=self._settings,
+            )
+            self._replay_worker.frameReady.connect(self._on_frame_ready)
+            self._replay_worker.statusReceived.connect(self._on_status_received)
+            self._replay_worker.targetsUpdated.connect(self._on_radar_targets)
+            self._replay_worker.statsUpdated.connect(self._on_radar_stats)
+            self._replay_worker.errorOccurred.connect(self._on_worker_error)
+            self._replay_worker.playbackStateChanged.connect(
+                self._on_playback_state_changed)
+            self._replay_worker.frameIndexChanged.connect(
+                self._on_frame_index_changed)
+
+            # Start worker (paused initially)
+            self._replay_worker.start()
+
+            # UI state
+            self._running = True
+            self._start_time = time.time()
+            self._frame_count = 0
+            self._start_btn.setEnabled(False)
+            self._stop_btn.setEnabled(True)
+            self._mode_combo.setEnabled(False)
+            self._playback_frame.setVisible(True)
+            self._pb_frame_label.setText(f"Frame: 0 / {info.n_frames}")
+            self._pb_file_label.setText(
+                f"{Path(npy_path).name} "
+                f"({info.n_chirps}x{info.n_samples}, "
+                f"{info.file_size_mb:.1f} MB)")
+            self._status_label_main.setText("Status: Raw IQ Replay (paused)")
+            self._sb_status.setText("Raw IQ Replay")
+            self._sb_mode.setText("Raw IQ Replay")
+            logger.info(f"Raw IQ Replay started: {npy_path}")
+
+        except (ValueError, OSError) as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Failed to load raw IQ file:\n{e}")
+            logger.error(f"Raw IQ load error: {e}")
+
+    # ---- Playback control slots --------------------------------------------
+
+    def _pb_play_pause(self):
+        """Toggle play/pause for raw IQ replay."""
+        if self._replay_controller is None:
+            return
+        state = self._replay_controller.state
+        if state == PlaybackState.PLAYING:
+            self._replay_controller.pause()
+            self._pb_play_btn.setText("Play")
+        else:
+            self._replay_controller.play()
+            self._pb_play_btn.setText("Pause")
+
+    def _pb_step(self):
+        """Step one frame forward in raw IQ replay."""
+        if self._replay_controller is not None:
+            self._replay_controller.step_forward()
+
+    def _pb_fps_changed(self, value: float):
+        if self._replay_controller is not None:
+            self._replay_controller.set_fps(value)
+
+    def _pb_loop_changed(self, checked: bool):
+        if self._replay_controller is not None:
+            self._replay_controller.set_loop(checked)
+
+    @pyqtSlot(str)
+    def _on_playback_state_changed(self, state_str: str):
+        if state_str == "playing":
+            self._pb_play_btn.setText("Pause")
+        elif state_str == "paused":
+            self._pb_play_btn.setText("Play")
+        elif state_str == "stopped":
+            self._pb_play_btn.setText("Play")
+            self._status_label_main.setText("Status: Replay finished")
+
+    @pyqtSlot(int, int)
+    def _on_frame_index_changed(self, current: int, total: int):
+        self._pb_frame_label.setText(f"Frame: {current} / {total}")
 
     # =====================================================================
     # Demo mode
@@ -1315,6 +1561,8 @@ class RadarDashboard(QMainWindow):
         self._demo_mode = False
         if not self._running:
             mode = "Idle"
+        elif self._replay_controller is not None:
+            mode = "Raw IQ Replay"
         elif isinstance(self._connection, ReplayConnection):
             mode = "Replay"
         else:
@@ -1714,6 +1962,11 @@ class RadarDashboard(QMainWindow):
     def closeEvent(self, event):
         if self._simulator:
             self._simulator.stop()
+        if self._replay_controller is not None:
+            self._replay_controller.stop()
+        if self._replay_worker is not None:
+            self._replay_worker.stop()
+            self._replay_worker.wait(1000)
         if self._radar_worker:
             self._radar_worker.stop()
             self._radar_worker.wait(1000)

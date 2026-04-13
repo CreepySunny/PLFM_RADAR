@@ -2,11 +2,14 @@
 v7.workers — QThread-based workers and demo target simulator.
 
 Classes:
-  - RadarDataWorker  — reads from FT2232H via production RadarAcquisition,
-                       parses 0xAA/0xBB packets, assembles 64x32 frames,
-                       runs host-side DSP, emits PyQt signals.
-  - GPSDataWorker    — reads GPS frames from STM32 CDC, emits GPSData signals.
-  - TargetSimulator  — QTimer-based demo target generator.
+  - RadarDataWorker      — reads from FT2232H via production RadarAcquisition,
+                           parses 0xAA/0xBB packets, assembles 64x32 frames,
+                           runs host-side DSP, emits PyQt signals.
+  - RawIQReplayWorker    — reads raw IQ .npy frames from RawIQReplayController,
+                           processes through RawIQFrameProcessor, emits same
+                           signals as RadarDataWorker + playback state.
+  - GPSDataWorker        — reads GPS frames from STM32 CDC, emits GPSData signals.
+  - TargetSimulator      — QTimer-based demo target generator.
 
 The old V6/V7 packet parsing (sync A5 C3 + type + CRC16) has been removed.
 All packet parsing now uses the production radar_protocol.py which matches
@@ -20,8 +23,6 @@ import queue
 import struct
 import logging
 
-import numpy as np
-
 from PyQt6.QtCore import QThread, QObject, QTimer, pyqtSignal
 
 from .models import RadarTarget, GPSData, RadarSettings
@@ -34,9 +35,11 @@ from .hardware import (
 )
 from .processing import (
     RadarProcessor,
+    RawIQFrameProcessor,
     USBPacketParser,
-    apply_pitch_correction,
+    extract_targets_from_frame,
 )
+from .raw_iq_replay import RawIQReplayController, PlaybackState
 
 logger = logging.getLogger(__name__)
 
@@ -206,55 +209,16 @@ class RadarDataWorker(QThread):
         Bin-to-physical conversion uses RadarSettings.range_resolution
         and velocity_resolution (should be calibrated to actual waveform).
         """
-        targets: list[RadarTarget] = []
-
         cfg = self._processor.config
         if not (cfg.clustering_enabled or cfg.tracking_enabled):
-            return targets
+            return []
 
-        # Extract detections from FPGA CFAR flags
-        det_indices = np.argwhere(frame.detections > 0)
-        r_res = self._settings.range_resolution
-        v_res = self._settings.velocity_resolution
-
-        for idx in det_indices:
-            rbin, dbin = idx
-            mag = frame.magnitude[rbin, dbin]
-            snr = 10 * np.log10(max(mag, 1)) if mag > 0 else 0
-
-            # Convert bin indices to physical units
-            range_m = float(rbin) * r_res
-            # Doppler: centre bin (16) = 0 m/s; positive bins = approaching
-            velocity_ms = float(dbin - 16) * v_res
-
-            # Apply pitch correction if GPS data available
-            raw_elev = 0.0  # FPGA doesn't send elevation per-detection
-            corr_elev = raw_elev
-            if self._gps:
-                corr_elev = apply_pitch_correction(raw_elev, self._gps.pitch)
-
-            # Compute geographic position if GPS available
-            lat, lon = 0.0, 0.0
-            azimuth = 0.0  # No azimuth from single-beam; set to heading
-            if self._gps:
-                azimuth = self._gps.heading
-                lat, lon = polar_to_geographic(
-                    self._gps.latitude, self._gps.longitude,
-                    range_m, azimuth,
-                )
-
-            target = RadarTarget(
-                id=len(targets),
-                range=range_m,
-                velocity=velocity_ms,
-                azimuth=azimuth,
-                elevation=corr_elev,
-                latitude=lat,
-                longitude=lon,
-                snr=snr,
-                timestamp=frame.timestamp,
-            )
-            targets.append(target)
+        targets = extract_targets_from_frame(
+            frame,
+            self._settings.range_resolution,
+            self._settings.velocity_resolution,
+            gps=self._gps,
+        )
 
         # DBSCAN clustering
         if cfg.clustering_enabled and len(targets) > 0:
@@ -264,6 +228,147 @@ class RadarDataWorker(QThread):
             if cfg.tracking_enabled:
                 targets = self._processor.association(targets, clusters)
                 self._processor.tracking(targets)
+
+        return targets
+
+
+# =============================================================================
+# Raw IQ Replay Worker (QThread) — processes raw .npy captures
+# =============================================================================
+
+class RawIQReplayWorker(QThread):
+    """Background worker for raw IQ replay mode.
+
+    Reads frames from a RawIQReplayController, processes them through
+    RawIQFrameProcessor (quantize -> AGC -> FFT -> CFAR -> RadarFrame),
+    and emits the same signals as RadarDataWorker so the dashboard can
+    display them identically.
+
+    Additional signal:
+        playbackStateChanged(str)  — "playing", "paused", "stopped"
+        frameIndexChanged(int, int) — (current_index, total_frames)
+
+    Signals:
+        frameReady(RadarFrame)
+        statusReceived(object)
+        targetsUpdated(list)
+        errorOccurred(str)
+        statsUpdated(dict)
+        playbackStateChanged(str)
+        frameIndexChanged(int, int)
+    """
+
+    frameReady = pyqtSignal(object)
+    statusReceived = pyqtSignal(object)
+    targetsUpdated = pyqtSignal(list)
+    errorOccurred = pyqtSignal(str)
+    statsUpdated = pyqtSignal(dict)
+    playbackStateChanged = pyqtSignal(str)
+    frameIndexChanged = pyqtSignal(int, int)
+
+    def __init__(
+        self,
+        controller: RawIQReplayController,
+        processor: RawIQFrameProcessor,
+        host_processor: RadarProcessor | None = None,
+        settings: RadarSettings | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._controller = controller
+        self._processor = processor
+        self._host_processor = host_processor
+        self._settings = settings or RadarSettings()
+        self._running = False
+        self._frame_count = 0
+        self._error_count = 0
+
+    def stop(self):
+        self._running = False
+        self._controller.stop()
+
+    def run(self):
+        self._running = True
+        self._frame_count = 0
+        logger.info("RawIQReplayWorker started")
+
+        info = self._controller.info
+        total_frames = info.n_frames if info else 0
+
+        while self._running:
+            try:
+                # Block until next frame or stop
+                raw_frame = self._controller.next_frame()
+                if raw_frame is None:
+                    # Stopped or end of file
+                    if self._running:
+                        self.playbackStateChanged.emit("stopped")
+                    break
+
+                # Process through full signal chain
+                import time as _time
+                ts = _time.time()
+                frame, status, _agc_result = self._processor.process_frame(
+                    raw_frame, timestamp=ts)
+                self._frame_count += 1
+
+                # Emit signals
+                self.frameReady.emit(frame)
+                self.statusReceived.emit(status)
+
+                # Emit frame index
+                idx = self._controller.frame_index
+                self.frameIndexChanged.emit(idx, total_frames)
+
+                # Emit playback state
+                state = self._controller.state
+                self.playbackStateChanged.emit(state.name.lower())
+
+                # Run host-side DSP if configured
+                if self._host_processor is not None:
+                    targets = self._extract_targets(frame)
+                    if targets:
+                        self.targetsUpdated.emit(targets)
+
+                # Stats
+                self.statsUpdated.emit({
+                    "frames": self._frame_count,
+                    "detection_count": frame.detection_count,
+                    "errors": self._error_count,
+                    "frame_index": idx,
+                    "total_frames": total_frames,
+                })
+
+                # Rate limiting: sleep to match target FPS
+                fps = self._controller.fps
+                if fps > 0 and self._controller.state == PlaybackState.PLAYING:
+                    self.msleep(int(1000.0 / fps))
+
+            except (ValueError, IndexError) as e:
+                self._error_count += 1
+                self.errorOccurred.emit(str(e))
+                logger.error(f"RawIQReplayWorker error: {e}")
+
+        self._running = False
+        logger.info("RawIQReplayWorker stopped")
+
+    def _extract_targets(self, frame: RadarFrame) -> list[RadarTarget]:
+        """Extract targets from detection mask using shared bin-to-physical conversion."""
+        targets = extract_targets_from_frame(
+            frame,
+            self._settings.range_resolution,
+            self._settings.velocity_resolution,
+        )
+
+        # Clustering + tracking
+        if self._host_processor is not None:
+            cfg = self._host_processor.config
+            if cfg.clustering_enabled and len(targets) > 0:
+                clusters = self._host_processor.clustering(
+                    targets, cfg.clustering_eps, cfg.clustering_min_samples)
+                if cfg.tracking_enabled:
+                    targets = self._host_processor.association(targets, clusters)
+                    self._host_processor.tracking(targets)
 
         return targets
 

@@ -2,9 +2,12 @@
 v7.processing — Radar signal processing and GPS parsing.
 
 Classes:
-  - RadarProcessor   — dual-CPI fusion, multi-PRF unwrap, DBSCAN clustering,
-                        association, Kalman tracking
-  - USBPacketParser   — parse GPS text/binary frames from STM32 CDC
+  - RadarProcessor       — dual-CPI fusion, multi-PRF unwrap, DBSCAN clustering,
+                           association, Kalman tracking
+  - RawIQFrameProcessor  — full signal chain for raw IQ replay:
+                           quantize -> AGC -> Range FFT -> Doppler FFT ->
+                           crop -> MTI -> DC notch -> mag -> CFAR
+  - USBPacketParser      — parse GPS text/binary frames from STM32 CDC
 
 Note: RadarPacketParser (old A5/C3 sync + CRC16 format) was removed.
       All packet parsing now uses production RadarProtocol (0xAA/0xBB format)
@@ -22,6 +25,11 @@ from .models import (
     RadarTarget, GPSData, ProcessingConfig,
     SCIPY_AVAILABLE, SKLEARN_AVAILABLE, FILTERPY_AVAILABLE,
 )
+from .agc_sim import (
+    AGCConfig, AGCState, AGCFrameResult,
+    quantize_iq, process_agc_frame,
+)
+from .hardware import RadarFrame, StatusResponse
 
 if SKLEARN_AVAILABLE:
     from sklearn.cluster import DBSCAN
@@ -46,6 +54,103 @@ def apply_pitch_correction(raw_elevation: float, pitch: float) -> float:
     Returns the corrected elevation = raw_elevation - pitch.
     """
     return raw_elevation - pitch
+
+
+# =============================================================================
+# Utility: bin-to-physical target extraction (shared by all workers)
+# =============================================================================
+
+def extract_targets_from_frame(
+    frame: RadarFrame,
+    range_resolution: float,
+    velocity_resolution: float,
+    *,
+    gps: GPSData | None = None,
+) -> list[RadarTarget]:
+    """Extract RadarTargets from a RadarFrame's detection mask.
+
+    Performs bin-to-physical conversion and optional GPS coordinate mapping.
+    This is the shared implementation used by both RadarDataWorker (live mode)
+    and RawIQReplayWorker (replay mode).
+
+    Args:
+        frame: RadarFrame with populated ``detections`` and ``magnitude`` arrays.
+        range_resolution: Metres per range bin.
+        velocity_resolution: m/s per Doppler bin.
+        gps: Optional GPSData for pitch correction and geographic mapping.
+
+    Returns:
+        List of RadarTarget with physical-unit range, velocity, SNR, and
+        (if GPS available) lat/lon/azimuth/elevation.
+    """
+    det_indices = np.argwhere(frame.detections > 0)
+    if len(det_indices) == 0:
+        return []
+
+    n_doppler = frame.magnitude.shape[1]
+    center_dbin = n_doppler // 2
+    targets: list[RadarTarget] = []
+
+    for idx in det_indices:
+        rbin, dbin = idx
+        mag = frame.magnitude[rbin, dbin]
+        snr = 10 * np.log10(max(mag, 1)) if mag > 0 else 0.0
+
+        range_m = float(rbin) * range_resolution
+        velocity_ms = float(dbin - center_dbin) * velocity_resolution
+
+        # GPS-dependent fields
+        raw_elev = 0.0
+        corr_elev = raw_elev
+        lat, lon, azimuth = 0.0, 0.0, 0.0
+        if gps is not None:
+            corr_elev = apply_pitch_correction(raw_elev, gps.pitch)
+            azimuth = gps.heading
+            lat, lon = _polar_to_geographic(
+                gps.latitude, gps.longitude, range_m, azimuth)
+
+        targets.append(RadarTarget(
+            id=len(targets),
+            range=range_m,
+            velocity=velocity_ms,
+            azimuth=azimuth,
+            elevation=corr_elev,
+            latitude=lat,
+            longitude=lon,
+            snr=snr,
+            timestamp=frame.timestamp,
+        ))
+
+    return targets
+
+
+def _polar_to_geographic(
+    radar_lat: float, radar_lon: float, range_m: float, bearing_deg: float,
+) -> tuple[float, float]:
+    """Convert polar (range, bearing) to geographic (lat, lon).
+
+    Uses the spherical-Earth approximation (adequate for <50 km ranges).
+    Duplicated from ``workers.polar_to_geographic`` to keep processing.py
+    self-contained; the workers module still exports its own copy for
+    backward-compat.
+    """
+    if range_m <= 0:
+        return radar_lat, radar_lon
+    earth_r = 6_371_000.0
+    lat_r = math.radians(radar_lat)
+    lon_r = math.radians(radar_lon)
+    brg_r = math.radians(bearing_deg)
+    d_r = range_m / earth_r
+
+    new_lat = math.asin(
+        math.sin(lat_r) * math.cos(d_r)
+        + math.cos(lat_r) * math.sin(d_r) * math.cos(brg_r)
+    )
+    new_lon = lon_r + math.atan2(
+        math.sin(brg_r) * math.sin(d_r) * math.cos(lat_r),
+        math.cos(d_r) - math.sin(lat_r) * math.sin(new_lat),
+    )
+    return math.degrees(new_lat), math.degrees(new_lon)
 
 
 # =============================================================================
@@ -451,3 +556,269 @@ class USBPacketParser:
         except (ValueError, struct.error) as e:
             logger.error(f"Error parsing binary GPS: {e}")
             return None
+
+
+# =============================================================================
+# Raw IQ Frame Processor — full signal chain for replay mode
+# =============================================================================
+
+class RawIQFrameProcessor:
+    """Process raw complex IQ frames through the full radar signal chain.
+
+    This replicates the FPGA processing pipeline in software so that
+    raw ADI CN0566 captures (or similar) can be visualised in the V7
+    dashboard exactly as they would appear from the FPGA.
+
+    Pipeline per frame:
+      1. Quantize raw complex → 16-bit signed I/Q
+      2. AGC gain application (bit-accurate to rx_gain_control.v)
+      3. Range FFT (across samples)
+      4. Doppler FFT (across chirps) + fftshift + centre crop
+      5. Optional MTI (2-pulse canceller using history)
+      6. Optional DC notch (zero-Doppler removal)
+      7. Magnitude (|I| + |Q| approximation matching FPGA, or true |.|)
+      8. CFAR or simple threshold detection
+      9. Build RadarFrame + synthetic StatusResponse
+    """
+
+    def __init__(
+        self,
+        n_range_out: int = 64,
+        n_doppler_out: int = 32,
+    ):
+        self._n_range = n_range_out
+        self._n_doppler = n_doppler_out
+
+        # AGC state (persists across frames)
+        self._agc_config = AGCConfig()
+        self._agc_state = AGCState()
+
+        # MTI history buffer (stores previous Range-Doppler maps)
+        self._mti_history: list[np.ndarray] = []
+        self._mti_enabled: bool = False
+
+        # DC notch
+        self._dc_notch_width: int = 0
+
+        # CFAR / threshold config
+        self._cfar_enabled: bool = False
+        self._cfar_guard: int = 2
+        self._cfar_train: int = 8
+        self._cfar_alpha_q44: int = 0x30  # Q4.4 → 3.0
+        self._cfar_mode: int = 0  # 0=CA, 1=GO, 2=SO
+        self._detect_threshold: int = 10000
+
+        # Frame counter
+        self._frame_number: int = 0
+
+        # Host-side processing (windowing, clustering, etc.)
+        self._host_processor = RadarProcessor()
+
+    # ---- Configuration setters ---------------------------------------------
+
+    def set_agc_config(self, config: AGCConfig) -> None:
+        self._agc_config = config
+
+    def reset_agc_state(self) -> None:
+        """Reset AGC state (e.g. on seek)."""
+        self._agc_state = AGCState()
+        self._mti_history.clear()
+
+    def set_mti_enabled(self, enabled: bool) -> None:
+        if self._mti_enabled != enabled:
+            self._mti_history.clear()
+        self._mti_enabled = enabled
+
+    def set_dc_notch_width(self, width: int) -> None:
+        self._dc_notch_width = max(0, min(7, width))
+
+    def set_cfar_params(
+        self,
+        enabled: bool,
+        guard: int = 2,
+        train: int = 8,
+        alpha_q44: int = 0x30,
+        mode: int = 0,
+    ) -> None:
+        self._cfar_enabled = enabled
+        self._cfar_guard = guard
+        self._cfar_train = train
+        self._cfar_alpha_q44 = alpha_q44
+        self._cfar_mode = mode
+
+    def set_detect_threshold(self, threshold: int) -> None:
+        self._detect_threshold = threshold
+
+    @property
+    def agc_state(self) -> AGCState:
+        return self._agc_state
+
+    @property
+    def agc_config(self) -> AGCConfig:
+        return self._agc_config
+
+    @property
+    def frame_number(self) -> int:
+        return self._frame_number
+
+    # ---- Main processing entry point ---------------------------------------
+
+    def process_frame(
+        self,
+        raw_frame: np.ndarray,
+        timestamp: float = 0.0,
+    ) -> tuple[RadarFrame, StatusResponse, AGCFrameResult]:
+        """Process one raw IQ frame through the full chain.
+
+        Parameters
+        ----------
+        raw_frame : complex array, shape (n_chirps, n_samples)
+        timestamp : frame timestamp for RadarFrame
+
+        Returns
+        -------
+        (radar_frame, status_response, agc_result)
+        """
+        n_chirps, _n_samples = raw_frame.shape
+        self._frame_number += 1
+
+        # 1. Quantize to 16-bit signed IQ
+        frame_i, frame_q = quantize_iq(raw_frame)
+
+        # 2. AGC
+        agc_result = process_agc_frame(
+            frame_i, frame_q, self._agc_config, self._agc_state)
+
+        # Use AGC-shifted IQ for downstream processing
+        iq = agc_result.shifted_i.astype(np.float64) + 1j * agc_result.shifted_q.astype(np.float64)
+
+        # 3. Range FFT (across samples axis)
+        range_fft = np.fft.fft(iq, axis=1)[:, :self._n_range]
+
+        # 4. Doppler FFT (across chirps axis) + fftshift + centre crop
+        doppler_fft = np.fft.fft(range_fft, axis=0)
+        doppler_fft = np.fft.fftshift(doppler_fft, axes=0)
+        # Centre-crop to n_doppler bins
+        center = n_chirps // 2
+        half_d = self._n_doppler // 2
+        start_d = max(0, center - half_d)
+        end_d = start_d + self._n_doppler
+        if end_d > n_chirps:
+            end_d = n_chirps
+            start_d = max(0, end_d - self._n_doppler)
+        rd_complex = doppler_fft[start_d:end_d, :]
+        # shape: (n_doppler, n_range) → transpose to (n_range, n_doppler)
+        rd_complex = rd_complex.T
+
+        # 5. Optional MTI (2-pulse canceller)
+        if self._mti_enabled:
+            rd_complex = self._apply_mti(rd_complex)
+
+        # 6. Optional DC notch (zero-Doppler bins)
+        if self._dc_notch_width > 0:
+            rd_complex = self._apply_dc_notch(rd_complex)
+
+        # Extract I/Q for RadarFrame
+        rd_i = np.round(rd_complex.real).astype(np.int16)
+        rd_q = np.round(rd_complex.imag).astype(np.int16)
+
+        # 7. Magnitude (FPGA uses |I|+|Q| approximation)
+        magnitude = np.abs(rd_complex.real) + np.abs(rd_complex.imag)
+
+        # Range profile (sum across Doppler)
+        range_profile = np.sum(magnitude, axis=1)
+
+        # 8. Detection (CFAR or simple threshold)
+        if self._cfar_enabled:
+            detections = self._run_cfar(magnitude)
+        else:
+            detections = self._run_threshold(magnitude)
+
+        detection_count = int(np.sum(detections > 0))
+
+        # 9. Build RadarFrame
+        radar_frame = RadarFrame(
+            timestamp=timestamp,
+            range_doppler_i=rd_i,
+            range_doppler_q=rd_q,
+            magnitude=magnitude,
+            detections=detections,
+            range_profile=range_profile,
+            detection_count=detection_count,
+            frame_number=self._frame_number,
+        )
+
+        # 10. Build synthetic StatusResponse
+        status = self._build_status(agc_result)
+
+        return radar_frame, status, agc_result
+
+    # ---- Internal helpers --------------------------------------------------
+
+    def _apply_mti(self, rd: np.ndarray) -> np.ndarray:
+        """2-pulse MTI canceller: y[n] = x[n] - x[n-1]."""
+        self._mti_history.append(rd.copy())
+        if len(self._mti_history) > 2:
+            self._mti_history = self._mti_history[-2:]
+
+        if len(self._mti_history) < 2:
+            return np.zeros_like(rd)  # suppress first frame
+
+        return self._mti_history[-1] - self._mti_history[-2]
+
+    def _apply_dc_notch(self, rd: np.ndarray) -> np.ndarray:
+        """Zero out centre Doppler bins (DC notch)."""
+        n_doppler = rd.shape[1]
+        center = n_doppler // 2
+        w = self._dc_notch_width
+        lo = max(0, center - w)
+        hi = min(n_doppler, center + w + 1)
+        result = rd.copy()
+        result[:, lo:hi] = 0
+        return result
+
+    def _run_cfar(self, magnitude: np.ndarray) -> np.ndarray:
+        """Run 1-D CFAR along each range bin (Doppler direction).
+
+        Uses the host-side CFAR from RadarProcessor with alpha converted
+        from Q4.4 to float.
+        """
+        alpha_float = self._cfar_alpha_q44 / 16.0
+        cfar_types = {0: "CA-CFAR", 1: "GO-CFAR", 2: "SO-CFAR"}
+        cfar_type = cfar_types.get(self._cfar_mode, "CA-CFAR")
+
+        power = magnitude ** 2
+        power = np.maximum(power, 1e-20)
+
+        mask = np.zeros_like(magnitude, dtype=np.uint8)
+        for r in range(magnitude.shape[0]):
+            row = power[r, :]
+            if row.max() > 0:
+                det = RadarProcessor.cfar_1d(
+                    row, self._cfar_guard, self._cfar_train,
+                    alpha_float, cfar_type)
+                mask[r, :] = det.astype(np.uint8)
+        return mask
+
+    def _run_threshold(self, magnitude: np.ndarray) -> np.ndarray:
+        """Simple threshold detection (matches FPGA detect_threshold)."""
+        return (magnitude > self._detect_threshold).astype(np.uint8)
+
+    def _build_status(self, agc_result: AGCFrameResult) -> StatusResponse:
+        """Build a synthetic StatusResponse from current processor state."""
+        return StatusResponse(
+            radar_mode=1,  # active
+            stream_ctrl=0b111,
+            cfar_threshold=self._detect_threshold,
+            long_chirp=3000,
+            long_listen=13700,
+            guard=17540,
+            short_chirp=50,
+            short_listen=17450,
+            chirps_per_elev=32,
+            range_mode=0,
+            agc_current_gain=agc_result.gain_enc,
+            agc_peak_magnitude=agc_result.peak_mag_8bit,
+            agc_saturation_count=agc_result.saturation_count,
+            agc_enable=1 if self._agc_config.enabled else 0,
+        )
