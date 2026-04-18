@@ -5,140 +5,101 @@ for getting a change reviewed and merged.
 
 ## Getting started
 
-1. Fork the repository and create a topic branch from `develop`.
-2. Keep generated outputs (Vivado projects, bitstreams, build logs)
-   out of version control — the `.gitignore` already covers most of
-   these.
+1. Fork the repository and create a topic branch from `develop`. The `main` branch is for production releases only.
+2. Keep generated outputs (Vivado projects, bitstreams, build logs) out of version control.
+
+### Security Mandate: Package Installation
+Due to supply chain attack risks, **ALL package installations MUST use the `sfw` (secure firewall) prefix**.
+- Python: `sfw uv pip install <package>` (Do not use raw pip)
+- Node/JS: `sfw npm install <package>`
+- Rust/Cargo: `sfw cargo <command>`
+
+Never run bare package installation commands without the `sfw` prefix.
 
 ## Repository layout
 
 | Path | Contents |
 |------|----------|
 | `4_Schematics and Boards Layout/` | KiCad schematics, Gerbers, BOM/CPL |
+| `9_Firmware/9_1_Microcontroller/` | STM32 MCU C/C++ firmware and unit tests |
 | `9_Firmware/9_2_FPGA/` | Verilog RTL, constraints, testbenches, build scripts |
-| `9_Firmware/9_2_FPGA/formal/` | SymbiYosys formal-verification wrappers |
-| `9_Firmware/9_2_FPGA/scripts/` | Vivado TCL build & debug scripts |
-| `9_Firmware/9_3_GUI/` | Python radar dashboard (Tkinter + matplotlib) |
+| `9_Firmware/9_3_GUI/` | Python radar dashboard (Tkinter/PyQt6) and CLI tools |
+| `9_Firmware/tests/cross_layer/` | Python-based system invariant/contract tests |
 | `docs/` | GitHub Pages documentation site |
 
-## Before submitting a pull request
+## Code Standards & Tooling
 
-- **Python** — verify syntax: `python3 -m py_compile <file>`
-- **Verilog** — if you have Vivado, run the relevant `build*.tcl`;
-  if not, note which scripts your change affects
-- **Whitespace** — `git diff --check` should be clean
-- Keep PRs focused: one logical change per PR is easier to review
-- **Run the regression tests** (see below)
+- **Python (GUI, Scripts, Tests)**:
+  - We use `uv` for dependency management.
+  - We strictly enforce linting with `ruff`. Run `uv run ruff check .` before committing.
+  - Test with `pytest`.
+- **Verilog (FPGA)**:
+  - The RTL (`radar_system_top.v`) is the single source of truth for opcode values, bit widths, reset defaults, and valid ranges.
+  - Testbenches must include **adversarial validation**: actively test boundary conditions, race conditions, unexpected input sequences, and reset mid-operation.
+  - Use `iverilog` for simulation.
+- **C/C++ (MCU)**:
+  - Use `make test` for host-side unit testing (cpputest).
+- **System-Level Invariants**:
+  - Whenever adding code, verify that system-level invariants (across module, process, and chip boundaries) hold true.
 
-## Running regression tests
+## Running the Test Suites
 
-After any change, run the relevant test suites to verify nothing is
-broken. All commands assume you are at the repository root.
+We use GitHub Actions for CI, which runs four main jobs on every PR. Run these locally before pushing.
 
-### Prerequisites
+### 1. Python & Linting
+```bash
+uv run ruff check .
+cd 9_Firmware/9_3_GUI
+uv run pytest test_GUI_V65_Tk.py test_v7.py -v
+```
 
-| Tool | Used by | Install |
-|------|---------|---------|
-| [Icarus Verilog](http://iverilog.icarus.com/) (`iverilog`) | FPGA regression | `brew install icarus-verilog` / `apt install iverilog` |
-| Python 3.8+ | GUI tests, co-sim | Usually pre-installed |
-| GNU Make | MCU tests | Usually pre-installed |
-| [SymbiYosys](https://symbiyosys.readthedocs.io/) (`sby`) | Formal verification | Optional — see SymbiYosys docs |
-
-### FPGA regression (RTL lint + unit/integration/signal-processing tests)
-
+### 2. FPGA Regression
 ```bash
 cd 9_Firmware/9_2_FPGA
 bash run_regression.sh
 ```
+This runs five phases (Lint, Changed Modules, Integration, Signal Processing, Infrastructure, and **P0 Adversarial Tests**). All must pass.
 
-This runs four phases:
-
-| Phase | What it checks |
-|-------|----------------|
-| 0 — Lint | `iverilog -Wall` on all production RTL + static regex checks |
-| 1 — Changed Modules | Unit tests for individual blocks (CIC, Doppler, CFAR, etc.) |
-| 2 — Integration | DDC chain, receiver golden-compare, system-top, end-to-end |
-| 3 — Signal Processing | FFT engine, NCO, FIR, matched filter chain |
-| 4 — Infrastructure | CDC modules, edge detector, USB interface, range-bin decimator, mode controller |
-
-All tests must pass (exit code 0). Advisory lint warnings (e.g., `case
-without default`) are non-blocking.
-
-### MCU unit tests
-
+### 3. MCU Unit Tests
 ```bash
 cd 9_Firmware/9_1_Microcontroller/tests
-make clean && make all
+make clean && make
 ```
 
-Runs 20 C-based unit tests covering safety, bug-fix, and gap-3 tests.
-Every test binary must exit 0.
-
-### GUI / dashboard tests
-
+### 4. Cross-Layer Contract Tests
 ```bash
-cd 9_Firmware/9_3_GUI
-python3 -m pytest test_GUI_V65_Tk.py -v
-# or without pytest:
-python3 -m unittest test_GUI_V65_Tk -v
+uv run pytest 9_Firmware/tests/cross_layer/test_cross_layer_contract.py -v
 ```
 
-57+ protocol and rendering tests. The `test_record_and_stop` test
-requires `h5py` and will be skipped if it is not installed.
+## Before merging: CI checklist
 
-### Co-simulation (Python vs RTL golden comparison)
+All PRs must pass CI:
 
-Run from the co-sim directory after a successful FPGA regression (the
-regression generates the RTL CSV outputs that the co-sim scripts compare
-against):
+| Job | What it checks |
+|----|---------------|
+| `python-tests` | ruff clean + pytest green |
+| `mcu-tests` | make all exits 0 |
+| `fpga-regression` | run_regression.sh exits 0 |
+| `cross-layer-tests` | pytest exits 0 |
 
-```bash
-cd 9_Firmware/9_2_FPGA/tb/cosim
+## Important Notes
 
-# Validate all .mem files (twiddles, chirp ROMs, addressing)
-python3 validate_mem_files.py
+- **NO LEGACY COMPATIBILITY** unless explicitly requested by the maintainer.
+- **The FPGA RTL (`radar_system_top.v`) is the single source of truth** for opcode values, bit widths, reset defaults, and valid ranges. All other layers must align to it.
+- **Adversarial testing is mandatory**: Every test must actively try to break the code.
+- **Testbench timing**: Always add a `#1` delay after `@(posedge clk)` before driving DUT inputs with blocking assignments.
+- **Pre-fetch FIFO**: Remember `wr_full` is asserted after DEPTH+1 writes, not just DEPTH.
 
-# DDC chain: RTL vs Python model (5 scenarios)
-python3 compare.py dc
-python3 compare.py single_target
-python3 compare.py multi_target
-python3 compare.py noise_only
-python3 compare.py sine_1mhz
+## Checklist Before Push
 
-# Doppler processor: RTL vs golden reference
-python3 compare_doppler.py stationary
-
-# Matched filter: RTL vs Python model (4 scenarios)
-python3 compare_mf.py all
-```
-
-Each script prints PASS/FAIL per scenario and exits non-zero on failure.
-
-### Formal verification (optional)
-
-Requires SymbiYosys (`sby`), Yosys, and a solver (z3 or boolector):
-
-```bash
-cd 9_Firmware/9_2_FPGA/formal
-sby -f fv_doppler_processor.sby
-sby -f fv_radar_mode_controller.sby
-```
-
-### Quick checklist
-
-Before pushing, confirm:
-
-1. `bash run_regression.sh` — all phases pass
-2. `make all` (MCU tests) — 20/20 pass
-3. `python3 -m unittest test_GUI_V65_Tk -v` — all pass
-4. `python3 validate_mem_files.py` — all checks pass
-5. `python3 compare.py dc && python3 compare_doppler.py stationary && python3 compare_mf.py all`
-6. `git diff --check` — no whitespace issues
-
-## Areas where help is especially welcome
-
-See the list in [README.md](README.md#-contributing).
+- [ ] `uv run ruff check .` — no lint errors
+- [ ] `uv run pytest test_GUI_V65_Tk.py test_v7.py -v` — all pass
+- [ ] `cd 9_Firmware/9_2_FPGA && bash run_regression.sh` — all 5 phases pass
+- [ ] `cd 9_Firmware/9_1_Microcontroller/tests && make clean && make` — pass
+- [ ] `uv run pytest 9_Firmware/tests/cross_layer/test_cross_layer_contract.py` — pass
+- [ ] `git diff --check` — no whitespace issues
+- [ ] PR targets `develop` branch
 
 ## Questions?
 
-Open a GitHub issue — that way the discussion is visible to everyone.
+Open a GitHub issue — discussion is visible to everyone.
